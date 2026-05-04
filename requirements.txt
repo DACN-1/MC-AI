@@ -1,0 +1,41 @@
+# Python 3.10 VLA Action Head Training Requirements
+# Compatible with Python 3.10.4+ on JURECA DC cluster
+
+# Core ML libraries - CUDA 11.7 compatible versions
+torch==2.1.0
+torchvision==0.16.0
+torchaudio==2.1.0
+
+# Computer vision and image processing
+opencv-python>=4.5.0
+Pillow>=9.0.0
+
+# Transformers and LLaVA - Python 3.10 compatible (pinned for torch 2.1.0)
+transformers>=4.37.0,<4.45.0
+accelerate>=0.20.0,<0.35.0
+sentencepiece>=0.1.97
+
+# Data processing and utilities - NumPy 1.x for compatibility
+numpy<2.0
+tqdm>=4.64.0
+scikit-learn>=1.1.0
+matplotlib>=3.5.0
+h5py>=3.8.0  # HDF5 for efficient frame storage (Level 1 chunking)
+
+# Additional scripts dependencies
+seaborn>=0.11.0  # For enhanced plotting in evaluate_model.py
+
+# MineRL and game environment
+gym3>=0.3.3
+attrs>=21.4.0
+
+# Additional utilities
+coloredlogs>=15.0
+
+# Built-in modules (no installation needed)
+# json - Python 3.10 built-in
+# argparse - Python 3.10 built-in  
+# pathlib - Python 3.10 built-in (pathlib2 not needed)
+# logging - Python 3.10 built-in
+# shutil - Python 3.10 built-in
+# time - Python 3.10 built-in

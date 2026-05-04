@@ -1,0 +1,147 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+.conda/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# PyCharm
+.idea/
+
+# Data directories
+data/
+datasets/
+videos/
+trajectories/
+models/
+checkpoints/
+weights/
+*.pt
+*.pth
+*.weights
+*.model
+
+# Logs
+logs/
+*.log
+*.out
+*.err
+
+# Temporary files
+tmp/
+temp/
+.tmp/
+.cache/
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# MineRL specific
+.minerl/
+
+# Downloaded data
+index/*.json
+data/**/
+!data/README.md
+
+# Training outputs
+results/
+experiments/
+wandb/
+
+# System files
+*.pid
+*.seed
+*.coverage
+.coverage.*
+coverage.xml
+*.cover
+.hypothesis/
+.pytest_cache/
+
+# Environment variables
+.env.local
+.env.production
+
+# Compressed files
+*.zip
+*.tar.gz
+*.rar
+
+# Video files (too large for git)
+*.mp4
+*.avi
+*.mov
+*.mkv
+
+# Image sequences
+frame_*.png
+frame_*.jpg
+
+# Compiled files
+*.o
+*.so
+*.dylib
+
+# Generated documentation
+docs/_build/
+site/
+
+# Created by setup.sh
+activate.sh
+system_info.py
+quick_test.py
+SETUP_README.md
+
+# Backup files
+*.bak
+*.backup
+
+# Claude
+.claude/
+
+# LLaVA model cache (large binary files)
+llava_model_cache/
