@@ -90,6 +90,7 @@ data/**/
 # Training outputs
 results/
 experiments/
+rollout_logs/
 wandb/
 
 # System files

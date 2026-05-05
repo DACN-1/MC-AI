@@ -10,7 +10,7 @@ from transformers import (
 
 
 class VLAAgent(nn.Module):
-    def __init__(self, NUM_ACTIONS: int, backbone: str = "llava-hf/llava-1.5-7b-hf"):
+    def __init__(self, NUM_ACTIONS: int, backbone: str = "llava-hf/llava-1.5-7b-hf", use_language: bool = True):
         super().__init__()
         self.processor = LlavaProcessor.from_pretrained(backbone)
         self.llava     = LlavaForConditionalGeneration.from_pretrained(
@@ -31,14 +31,22 @@ class VLAAgent(nn.Module):
             nn.Linear(hidden, NUM_ACTIONS),
         )
         
+        self.use_language = use_language
+
         if self.llava.device.type == "cpu":
             self.action_head = self.action_head.float()  # float32 on CPU
         else:
             self.action_head = self.action_head.half()   # float16 on GPU
 
     def forward(self, images, texts):
+        """Run a forward pass and return action logits of shape (B, NUM_ACTIONS).
+
+        When use_language=False the text input is replaced with empty strings so
+        only visual features contribute to the action head.
+        """
+        effective_texts = texts if self.use_language else [""] * len(texts)
         # Ensure each prompt includes the <image> placeholder token required by LLaVA
-        texts = [t if "<image>" in t else f"<image>\n{t}" for t in texts]
+        texts = [t if "<image>" in t else f"<image>\n{t}" for t in effective_texts]
         inputs = self.processor(
             images=images,
             text=texts,
