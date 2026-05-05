@@ -1,0 +1,68 @@
+% Mit twoside als weitere Option werden die Seitenränder angepasst, sodass beidseitig gedruckt werden kann
+\documentclass[pdftex,12pt,a4paper]{report}
+
+% kann optional mit "german" als Sprache gewählt werden
+\usepackage[]{dbstmpl}
+
+
+
+\global\arbeit{Bachelor Thesis}
+%\global\arbeit{Masterarbeit}
+%\global\arbeit{Seminararbeit}
+
+
+
+
+% Hier die eigenen Daten eintragen
+\global\titel{TITEL DER ARBEIT KANN AUCH EINE ZWEITE ZEILE HABEN}
+\global\bearbeiter{BEARBEITERNAME}
+\global\betreuer{BETREUERNAME}
+\global\aufgabensteller{AUFGABENSTELLERNAME}
+\global\abgabetermin{20.10.2017}
+\global\ort{ORT}
+\global\fach{Computer Science}
+
+\begin{document}
+
+% Deckblatt
+\deckblatt
+
+% Erklaerung fuer das Pruefungsamt
+% Bei Seminararbeiten nicht noetig
+\erklaerung
+
+% Zusammenfassung
+\begin{abstract}
+Dieses Dokument dient als Muster für die Ausarbeitung einer \the\arbeit\
+am Lehrstuhl für Datenbanksysteme am Institut für
+Informatik der LMU München. Der Abstract sollte nicht mehr als 300 Wörter enthalten.
+\end{abstract}
+
+% Inhaltsverzeichnis (abhaengig von der Laenge des Dokuments)
+\tableofcontents
+
+% Hier beginnt der Hauptteil
+
+\input{Introduction}
+
+
+
+
+
+
+
+
+
+%% Ende Hauptteil
+
+% Abbildungsverzeichnis (kann auch nach dem Inhaltsverzeichnis kommen)
+%\listoffigures
+
+% Tabellenverzeichnis (kann auch nach dem Inhaltsverzeichnis kommen)
+%\listoftables
+
+% Literaturverzeichnis
+\bibliographystyle{plain} 
+\bibliography{dbstmpl}         % verwendet dbstmpl.bib
+
+\end{document}

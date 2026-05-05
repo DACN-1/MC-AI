@@ -1,0 +1,17 @@
+services:
+  minerl:
+    platform: linux/amd64
+    build:
+      context: .
+      platforms:
+        - linux/amd64
+    init: true
+    volumes:
+      - .:/workspace
+      - minerl_cache:/root/.minerl
+    environment:
+      - DISPLAY=:1
+    command: test_minerl.py
+
+volumes:
+  minerl_cache:
