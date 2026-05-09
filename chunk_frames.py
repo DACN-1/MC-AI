@@ -20,19 +20,31 @@ from typing import Optional
 import argparse
 
 
+_VALID_COMPRESSION = {"gzip", "none"}
+
+
 class FrameChunker:
     """Convert extracted PNG frames or MP4 videos into HDF5 chunks for efficient storage and access."""
 
-    def __init__(self, frames_per_chunk: int = 100, compression: str = "lz4"):
+    def __init__(self, frames_per_chunk: int = 100, compression: str = "gzip"):
         """
         Initialize FrameChunker.
 
         Args:
             frames_per_chunk: Number of frames per HDF5 chunk (default: 100)
-            compression: Compression algorithm ('lz4' for speed, 'gzip' for size)
+            compression: Compression algorithm ('gzip' or 'none').
         """
+        if compression not in _VALID_COMPRESSION:
+            raise ValueError(
+                f"Unsupported compression {compression!r}. Choose one of {sorted(_VALID_COMPRESSION)}."
+            )
         self.frames_per_chunk = frames_per_chunk
         self.compression = compression
+
+    def _h5_compression_kwargs(self) -> dict:
+        if self.compression == "gzip":
+            return {"compression": "gzip", "compression_opts": 4}
+        return {}
 
     def chunk_video(
         self,
@@ -83,31 +95,50 @@ class FrameChunker:
 
             # Create HDF5 file with chunked dataset
             with h5py.File(output_file, 'w') as f:
-                # Create chunked dataset
                 dset = f.create_dataset(
                     'frames',
                     shape=(total_frames, frame_height, frame_width, 3),
+                    maxshape=(None, frame_height, frame_width, 3),
                     dtype=np.uint8,
                     chunks=(self.frames_per_chunk, frame_height, frame_width, 3),
-                    compression=self.compression if self.compression != 'lz4' else 'gzip',
-                    compression_opts=4 if self.compression == 'gzip' else None
+                    **self._h5_compression_kwargs(),
                 )
 
-                # Read and write frames one by one
+                # Buffer one chunk in RAM before writing to avoid re-encoding
+                # the same chunk on every per-frame write.
+                buffer = np.empty(
+                    (self.frames_per_chunk, frame_height, frame_width, 3), dtype=np.uint8
+                )
+                buffer_fill = 0
+                buffer_start = 0
+                frames_written = 0
+
                 iterator = range(total_frames)
                 if verbose:
                     iterator = tqdm(iterator, desc="  Writing frames")
 
-                for idx in iterator:
+                for _ in iterator:
                     ret, frame = cap.read()
                     if not ret:
                         if verbose:
-                            print(f"\n  Warning: Failed to read frame {idx}/{total_frames}")
+                            print(f"\n  Warning: Failed to read frame {frames_written}/{total_frames}")
                         break
+                    buffer[buffer_fill] = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    buffer_fill += 1
+                    frames_written += 1
+                    if buffer_fill == self.frames_per_chunk:
+                        dset[buffer_start : buffer_start + buffer_fill] = buffer[:buffer_fill]
+                        buffer_start += buffer_fill
+                        buffer_fill = 0
 
-                    # Convert BGR to RGB
-                    frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                    dset[idx] = frame
+                if buffer_fill > 0:
+                    dset[buffer_start : buffer_start + buffer_fill] = buffer[:buffer_fill]
+                    frames_written = buffer_start + buffer_fill
+
+                # Trim dataset if the source video was shorter than reported
+                if frames_written < total_frames:
+                    dset.resize((frames_written, frame_height, frame_width, 3))
+                    total_frames = frames_written
 
                 # Store metadata
                 f.attrs['total_frames'] = total_frames
@@ -197,27 +228,35 @@ class FrameChunker:
         png_size = sum(f.stat().st_size for f in frame_files)
 
         with h5py.File(output_file, 'w') as f:
-            # Create chunked dataset with compression
             dset = f.create_dataset(
                 'frames',
                 shape=(len(frame_files), actual_height, actual_width, 3),
                 dtype=np.uint8,
                 chunks=(self.frames_per_chunk, actual_height, actual_width, 3),
-                compression=self.compression if self.compression != 'lz4' else 'gzip',
-                compression_opts=4 if self.compression == 'gzip' else None
+                **self._h5_compression_kwargs(),
             )
 
-            # Write frames with progress bar
+            buffer = np.empty(
+                (self.frames_per_chunk, actual_height, actual_width, 3), dtype=np.uint8
+            )
+            buffer_fill = 0
+            buffer_start = 0
+
             iterator = enumerate(frame_files)
             if verbose:
                 iterator = tqdm(iterator, total=len(frame_files), desc="  Writing frames")
 
-            for idx, frame_path in iterator:
-                # Read frame using OpenCV (faster than PIL)
-                img = cv2.imread(str(frame_path))
-                # Convert BGR to RGB
-                img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-                dset[idx] = img
+            for _, frame_path in iterator:
+                img = cv2.cvtColor(cv2.imread(str(frame_path)), cv2.COLOR_BGR2RGB)
+                buffer[buffer_fill] = img
+                buffer_fill += 1
+                if buffer_fill == self.frames_per_chunk:
+                    dset[buffer_start : buffer_start + buffer_fill] = buffer[:buffer_fill]
+                    buffer_start += buffer_fill
+                    buffer_fill = 0
+
+            if buffer_fill > 0:
+                dset[buffer_start : buffer_start + buffer_fill] = buffer[:buffer_fill]
 
             # Store metadata
             f.attrs['total_frames'] = len(frame_files)
@@ -438,7 +477,7 @@ def main():
     )
     parser.add_argument(
         '--compression',
-        choices=['lz4', 'gzip', 'none'],
+        choices=['gzip', 'none'],
         default='gzip',
         help='Compression algorithm (default: gzip)'
     )

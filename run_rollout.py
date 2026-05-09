@@ -1,4 +1,4 @@
-"""Run MineRL rollout episodes with VLAAgent or a random policy."""
+"""Run MineRL rollout episodes with a trained VLAAgent or a random policy."""
 
 import argparse
 import json
@@ -11,16 +11,24 @@ import numpy as np
 import torch
 from PIL import Image
 
+from VLAAgent import VLAAgent
 from action_mapping import map_to_minerl_action
+from constants import NUM_OUTPUT_LOGITS
 from eval_logger import EpisodeLogger
-from imitation_learning import NUM_ACTIONS
 
 
-def _load_agent(model_path: str):
-    from VLAAgent import VLAAgent
-
-    agent = VLAAgent(NUM_ACTIONS=NUM_ACTIONS)
-    agent.load_state_dict(torch.load(model_path, map_location="cpu"))
+def _load_agent(model_path: str, device: str) -> VLAAgent:
+    """Load a VLA checkpoint produced by imitation_learning.train_vla."""
+    ckpt = torch.load(model_path, map_location="cpu")
+    if not isinstance(ckpt, dict) or "state_dict" not in ckpt:
+        raise ValueError(
+            f"Checkpoint at {model_path} is not in the expected format "
+            "(missing 'state_dict' key). Expected a dict produced by train_vla()."
+        )
+    backbone = ckpt.get("llava_model", "llava-hf/llava-1.5-7b-hf")
+    agent = VLAAgent(output_dim=NUM_OUTPUT_LOGITS, backbone=backbone)
+    agent.action_head.load_state_dict(ckpt["state_dict"])
+    agent = agent.to(device)
     agent.eval()
     return agent
 
@@ -30,17 +38,24 @@ def _obs_to_pil(obs: dict) -> Image.Image:
     return Image.fromarray(pov)
 
 
-def _random_action(env):
-    """Return a no-op action with random camera perturbation."""
+def _random_action(env, binary_prob: float = 0.1):
+    """Return a no-op action with random binary flips and camera perturbation."""
     action = env.action_space.no_op()
     action["camera"] = np.array(
         [np.random.uniform(-5, 5), np.random.uniform(-5, 5)], dtype=np.float32
     )
+    _SKIP = {"ESC", "inventory"}  # these end/pause the episode
+    binary_keys = [
+        k for k in action
+        if k != "camera" and k not in _SKIP and isinstance(action[k], (int, np.integer))
+    ]
+    for key in binary_keys:
+        if np.random.random() < binary_prob:
+            action[key] = 1
     return action
 
 
 def _dominant_action_key(minerl_action: dict) -> str:
-    """Return the canonical key with the highest activation for logging."""
     for key in ["attack", "forward", "back", "left", "right", "jump", "use"]:
         if minerl_action.get(key, 0):
             return key
@@ -50,15 +65,26 @@ def _dominant_action_key(minerl_action: dict) -> str:
     return "none"
 
 
+def _resolve_device(requested: str) -> str:
+    if requested == "cuda" and not torch.cuda.is_available():
+        print("⚠️  CUDA requested but unavailable; falling back to CPU.")
+        return "cpu"
+    return requested
+
+
 def run(args: argparse.Namespace) -> None:
     os.makedirs(args.output_dir, exist_ok=True)
     logger = EpisodeLogger(output_dir=args.output_dir)
 
-    agent = _load_agent(args.model_path) if args.model_path else None
+    device = _resolve_device(args.device)
+    agent = _load_agent(args.model_path, device) if args.model_path else None
 
     env = gym.make(args.env)
+    # Captured once: gives us the canonical key set including pickItem/swapHands,
+    # which the model doesn't predict. We merge it under predicted actions per step.
+    no_op_template = env.action_space.no_op()
     print(f"Environment: {args.env}")
-    print(f"Policy: {'VLAAgent from ' + args.model_path if agent else 'random'}")
+    print(f"Policy: {'VLAAgent on ' + device + ' from ' + args.model_path if agent else 'random'}")
     print(f"Episodes: {args.episodes}   Max steps: {args.max_steps}")
     print()
 
@@ -66,10 +92,8 @@ def run(args: argparse.Namespace) -> None:
 
     for ep_idx in range(args.episodes):
         obs = env.reset()
-        total_reward = 0.0
         step_log = []
 
-        # Set up video writer for this episode if recording is enabled
         writer = None
         if args.record_video:
             first_frame = obs["pov"]
@@ -83,15 +107,14 @@ def run(args: argparse.Namespace) -> None:
             if agent is not None:
                 img = _obs_to_pil(obs)
                 with torch.no_grad():
-                    logits = agent([img], ["Play Minecraft"])[0]  # (23,)
-                minerl_action = map_to_minerl_action(logits)
-                action_vec = logits.cpu().tolist()
+                    logits = agent([img], [args.prompt])[0]
+                minerl_action = map_to_minerl_action(logits, base_action=no_op_template)
+                action_vec = logits.detach().cpu().tolist()
             else:
                 minerl_action = _random_action(env)
                 action_vec = []
 
             obs, reward, done, _info = env.step(minerl_action)
-            total_reward += float(reward)
 
             if writer is not None:
                 writer.write(cv2.cvtColor(obs["pov"], cv2.COLOR_RGB2BGR))
@@ -124,7 +147,6 @@ def run(args: argparse.Namespace) -> None:
             {"episode": ep_idx, "reward": ep_summary["total_reward"], "steps": ep_summary["steps"]}
         )
 
-        # Write per-step log
         step_log_path = os.path.join(args.output_dir, f"steps_{ep_idx:03d}.json")
         with open(step_log_path, "w") as f:
             json.dump(step_log, f)
@@ -140,7 +162,6 @@ def run(args: argparse.Namespace) -> None:
     print()
     logger.finalize(run_name=os.path.basename(args.output_dir))
 
-    # Final summary table
     print("\nEpisode Summary")
     print(f"{'Episode':>8}  {'Reward':>10}  {'Steps':>7}")
     print("-" * 32)
@@ -150,12 +171,22 @@ def run(args: argparse.Namespace) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run MineRL rollout episodes.")
-    parser.add_argument("--model-path", default=None, help="Path to VLAAgent weights (.pt)")
+    parser.add_argument("--model-path", default=None, help="Path to VLAAgent checkpoint (.pt)")
     parser.add_argument("--env", default="MineRLBasaltFindCave-v0", help="MineRL environment ID")
     parser.add_argument("--episodes", type=int, default=10)
     parser.add_argument("--max-steps", type=int, default=500)
     parser.add_argument("--output-dir", default="./rollout_logs")
     parser.add_argument("--record-video", action="store_true", help="Save each episode as an MP4")
+    parser.add_argument(
+        "--device",
+        default="cuda" if torch.cuda.is_available() else "cpu",
+        help="Device to run the agent on (cuda/cpu)",
+    )
+    parser.add_argument(
+        "--prompt",
+        default="Play Minecraft.",
+        help="Text prompt fed to the VLA backbone each step",
+    )
     args = parser.parse_args()
     run(args)
 

@@ -1,3 +1,0 @@
-[submodule "VPT"]
-	path = VPT
-	url = https://github.com/openai/Video-Pre-Training.git

@@ -30,7 +30,7 @@ seaborn>=0.11.0  # For enhanced plotting in evaluate_model.py
 gym==0.23.1
 gym3>=0.3.3
 attrs>=21.4.0
-# minerl installed from git in Dockerfile (v1.0, required for VPT compatibility)
+# minerl is installed from git inside the Dockerfile (v1.0)
 
 # Additional utilities
 coloredlogs>=15.0

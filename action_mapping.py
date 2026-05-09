@@ -1,48 +1,62 @@
 """Convert VLA model logits to a MineRL-compatible action dict."""
 
 import json
+from typing import Optional
+
 import numpy as np
 import torch
 
-from imitation_learning import CANONICAL_ACTION_KEYS
+from constants import (
+    BINARY_ACTION_KEYS,
+    NUM_BINARY,
+    NUM_CAMERA_BINS,
+    NUM_OUTPUT_LOGITS,
+)
+from vpt_camera import DEFAULT_CAMERA_QUANTIZER
 
-_CAMERA_X_IDX = CANONICAL_ACTION_KEYS.index("camera_x")
-_CAMERA_Y_IDX = CANONICAL_ACTION_KEYS.index("camera_y")
+
+_CAM_X_START = NUM_BINARY
+_CAM_X_END = NUM_BINARY + NUM_CAMERA_BINS
+_CAM_Y_END = NUM_BINARY + 2 * NUM_CAMERA_BINS  # = NUM_OUTPUT_LOGITS
 
 
-def map_to_minerl_action(logits: torch.Tensor, threshold: float = 0.5) -> dict:
-    """Convert a (23,) logit tensor from VLAAgent to a MineRL action dict.
+def map_to_minerl_action(
+    logits: torch.Tensor,
+    threshold: float = 0.5,
+    base_action: Optional[dict] = None,
+) -> dict:
+    """Convert a (NUM_OUTPUT_LOGITS,) logit tensor from VLAAgent to a MineRL action dict.
 
-    Binary actions are sigmoid-thresholded (int 0 or 1).
-    Camera actions preserve their sigmoid magnitude as a float32 numpy array [x, y].
+    - First NUM_BINARY entries: sigmoid + threshold -> int {0, 1}
+    - Next NUM_CAMERA_BINS entries: argmax -> camera_x bin index
+    - Final NUM_CAMERA_BINS entries: argmax -> camera_y bin index
+      Both bin indices are then mu-law-undiscretized to degrees.
 
-    Args:
-        logits: Tensor of shape (23,) — raw output from VLAAgent.
-        threshold: Sigmoid threshold for binary actions.
-
-    Returns:
-        dict with all 23 canonical action keys in MineRL BASALT format.
+    If `base_action` is provided (e.g. `env.action_space.no_op()`), the returned
+    dict is built on top of it so any keys MineRL expects but the model doesn't
+    predict (`pickItem`, `swapHands`, …) keep their no-op defaults.
     """
-    probs = torch.sigmoid(logits.float()).detach().cpu().numpy()
+    if logits.numel() != NUM_OUTPUT_LOGITS:
+        raise ValueError(
+            f"Expected logits of size {NUM_OUTPUT_LOGITS}, got {tuple(logits.shape)}"
+        )
 
-    action = {}
-    for i, key in enumerate(CANONICAL_ACTION_KEYS):
-        if key == "camera_x":
-            continue  # handled below as a pair
-        if key == "camera_y":
-            action["camera"] = np.array(
-                [probs[_CAMERA_X_IDX], probs[_CAMERA_Y_IDX]], dtype=np.float32
-            )
-        else:
-            action[key] = int(probs[i] >= threshold)
+    logits = logits.detach().float().cpu()
+    binary_probs = torch.sigmoid(logits[:NUM_BINARY]).numpy()
+    cam_x_bin = int(logits[_CAM_X_START:_CAM_X_END].argmax().item())
+    cam_y_bin = int(logits[_CAM_X_END:_CAM_Y_END].argmax().item())
+    cam_xy = DEFAULT_CAMERA_QUANTIZER.undiscretize(np.array([cam_x_bin, cam_y_bin]))
 
+    action: dict = dict(base_action) if base_action is not None else {}
+    for i, key in enumerate(BINARY_ACTION_KEYS):
+        action[key] = int(binary_probs[i] >= threshold)
+    action["camera"] = np.asarray(cam_xy, dtype=np.float32)
     return action
 
 
 if __name__ == "__main__":
     torch.manual_seed(0)
-    test_logits = torch.randn(23)
+    test_logits = torch.randn(NUM_OUTPUT_LOGITS)
     result = map_to_minerl_action(test_logits)
-    # Convert numpy arrays for JSON serialisation
     printable = {k: (v.tolist() if isinstance(v, np.ndarray) else v) for k, v in result.items()}
     print(json.dumps(printable, indent=2))

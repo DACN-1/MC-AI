@@ -6,7 +6,7 @@ import os
 from collections import defaultdict
 from typing import Callable, Optional
 
-from imitation_learning import CANONICAL_ACTION_KEYS
+from constants import CANONICAL_ACTION_KEYS
 
 
 def _default_success(ep: dict) -> bool:
