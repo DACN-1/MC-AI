@@ -1,11 +1,11 @@
 """VLA imitation learning: dataset, training loop, and evaluation."""
 
 from argparse import ArgumentParser
+from collections import OrderedDict
 import json
 import time
 from pathlib import Path
 
-import h5py
 import numpy as np
 import torch as th
 from PIL import Image
@@ -31,35 +31,31 @@ from vpt_camera import DEFAULT_CAMERA_QUANTIZER
 # Dataset
 # ---------------------------------------------------------------------
 class TrajectoryDataset(Dataset):
-    """Dataset over (frame, prompt, action) tuples sourced from HDF5 chunks.
+    """Dataset over (frame, prompt, action) tuples sourced from MP4 videos.
 
     Expected layout::
 
         root_dir/
-        ├── trajectory_task_<task>_length_<N>/
-        │   ├── all_actions.json           (preferred — consolidated)
-        │   └── all_infos.json             (optional)
-        │   OR
-        │   ├── actions/action_<stem>.jsonl   (legacy)
-        │   └── infos/info_<stem>.json
-        └── frames_chunked/video_<stem>.h5
+        └── trajectory_task_<task>_length_<N>/
+            ├── all_actions.json           (preferred — consolidated)
+            ├── all_infos.json             (optional)
+            ├── videos/video_<stem>.mp4
+            └── (legacy)
+                ├── actions/action_<stem>.jsonl
+                └── infos/info_<stem>.json
 
-    HDF5 file handles are cached per-worker on first access.
+    Frames are decoded on demand with `decord.VideoReader`. One reader is
+    cached per worker per file, bounded by `decoder_cache_size` (LRU).
     """
 
-    def __init__(self, root_dir: str):
+    def __init__(self, root_dir: str, decoder_cache_size: int = 64):
         self.samples: list[tuple[str, int, str, dict]] = []
+        self.decoder_cache_size = decoder_cache_size
         # opened lazily per worker; never share across processes
-        self._h5_cache: dict[str, h5py.File] | None = None
+        self._decoder_cache: OrderedDict | None = None
+        self._VideoReader = None
 
         root = Path(root_dir)
-        h5_root = root / "frames_chunked"
-
-        if not h5_root.exists():
-            raise FileNotFoundError(
-                f"HDF5 frames directory not found: {h5_root}\n"
-                f"Run: python chunk_frames.py --data-dir {root_dir}"
-            )
 
         for item in root.iterdir():
             if not item.is_dir() or not item.name.startswith("trajectory_task_"):
@@ -67,29 +63,22 @@ class TrajectoryDataset(Dataset):
 
             all_actions_path = item / "all_actions.json"
             if all_actions_path.exists():
-                self._load_consolidated(item, all_actions_path, item / "all_infos.json", h5_root)
+                self._load_consolidated(item, all_actions_path, item / "all_infos.json")
             else:
-                self._load_individual_files(item, h5_root)
+                self._load_individual_files(item)
 
-    def _add_samples(self, stem: str, actions: list, task_text: str, h5_root: Path) -> None:
-        h5_file = h5_root / f"video_{stem}.h5"
-        if not h5_file.exists():
-            print(f"Warning: missing HDF5 file for {stem}, skipping")
-            return
-        try:
-            with h5py.File(h5_file, "r") as f:
-                total_frames = f.attrs.get("total_frames", f["frames"].shape[0])
-        except Exception as e:
-            print(f"Error: failed to read {h5_file}: {e}")
-            return
-        if total_frames != len(actions):
-            print(f"Warning: frame/action mismatch for {stem} ({total_frames} vs {len(actions)}), skipping")
+    def _add_samples(
+        self, stem: str, actions: list, task_text: str, videos_dir: Path
+    ) -> None:
+        mp4_file = videos_dir / f"video_{stem}.mp4"
+        if not mp4_file.exists():
+            print(f"Warning: missing MP4 for {stem}, skipping")
             return
         for idx in range(len(actions)):
-            self.samples.append((str(h5_file), idx, task_text, actions[idx]))
+            self.samples.append((str(mp4_file), idx, task_text, actions[idx]))
 
     def _load_consolidated(
-        self, traj_dir: Path, all_actions_path: Path, all_infos_path: Path, h5_root: Path
+        self, traj_dir: Path, all_actions_path: Path, all_infos_path: Path
     ) -> None:
         with all_actions_path.open("r", encoding="utf-8") as fp:
             all_actions = json.load(fp)
@@ -97,13 +86,15 @@ class TrajectoryDataset(Dataset):
         if all_infos_path.exists():
             with all_infos_path.open("r", encoding="utf-8") as fp:
                 all_infos = json.load(fp)
+        videos_dir = traj_dir / "videos"
         for stem, actions in all_actions.items():
             task_text = all_infos.get(stem, {}).get("text_prompt", "play minecraft")
-            self._add_samples(stem, actions, task_text, h5_root)
+            self._add_samples(stem, actions, task_text, videos_dir)
 
-    def _load_individual_files(self, traj_dir: Path, h5_root: Path) -> None:
+    def _load_individual_files(self, traj_dir: Path) -> None:
         actions_dir = traj_dir / "actions"
         infos_dir = traj_dir / "infos"
+        videos_dir = traj_dir / "videos"
         if not actions_dir.exists():
             return
         for action_path in actions_dir.glob("action_*.jsonl"):
@@ -117,23 +108,37 @@ class TrajectoryDataset(Dataset):
                         info_data = json.loads(fp.readline()) if candidate.suffix == ".jsonl" else json.load(fp)
                     break
             task_text = info_data.get("text_prompt", "play minecraft")
-            self._add_samples(stem, actions, task_text, h5_root)
+            self._add_samples(stem, actions, task_text, videos_dir)
 
-    def _h5(self, path: str) -> h5py.File:
-        if self._h5_cache is None:
-            self._h5_cache = {}
-        f = self._h5_cache.get(path)
-        if f is None:
-            f = h5py.File(path, "r")
-            self._h5_cache[path] = f
-        return f
+    def _decoder(self, path: str):
+        if self._decoder_cache is None:
+            self._decoder_cache = OrderedDict()
+            try:
+                from decord import VideoReader
+            except ImportError as e:
+                raise ImportError(
+                    "decord is required for MP4 frame decoding. "
+                    "Install with: pip install decord"
+                ) from e
+            self._VideoReader = VideoReader
+        dec = self._decoder_cache.get(path)
+        if dec is None:
+            # num_threads=1: each DataLoader worker is already its own process,
+            # so per-reader threading would oversubscribe the CPUs.
+            dec = self._VideoReader(path, num_threads=1)
+            self._decoder_cache[path] = dec
+            if len(self._decoder_cache) > self.decoder_cache_size:
+                self._decoder_cache.popitem(last=False)
+        else:
+            self._decoder_cache.move_to_end(path)
+        return dec
 
     def __len__(self) -> int:  # type: ignore[override]
         return len(self.samples)
 
     def __getitem__(self, idx):
-        h5_path, frame_idx, task_text, act_dict = self.samples[idx]
-        frame_array = self._h5(h5_path)["frames"][frame_idx]
+        mp4_path, frame_idx, task_text, act_dict = self.samples[idx]
+        frame_array = self._decoder(mp4_path)[frame_idx].asnumpy()
         return Image.fromarray(frame_array), task_text, action_to_tensor(act_dict)
 
     def get_stats(self) -> dict:

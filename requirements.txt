@@ -20,7 +20,8 @@ numpy>=1.16.2,<1.24
 tqdm>=4.64.0
 scikit-learn>=1.1.0
 matplotlib>=3.5.0
-h5py>=3.8.0  # HDF5 for efficient frame storage (Level 1 chunking)
+h5py>=3.8.0  # only used by the deprecated chunk_frames.py — safe to drop once that file is removed
+decord>=0.6.0  # MP4 random-access frame decoding for TrajectoryDataset
 
 # Additional scripts dependencies
 seaborn>=0.11.0  # For enhanced plotting in evaluate_model.py

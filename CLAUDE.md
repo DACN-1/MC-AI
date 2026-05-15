@@ -47,9 +47,9 @@ r1v-a/
 ├── frozen_vision_baseline.py  CLIP-only baseline (same forward signature)
 ├── imitation_learning.py    TrajectoryDataset, vla_loss, train_vla, evaluate, CLI
 ├── action_mapping.py        Logits -> MineRL action dict (argmax + undiscretize)
-├── chunk_frames.py          MP4/PNG -> HDF5 chunked frames
+├── chunk_frames.py          (deprecated) MP4/PNG -> HDF5 chunked frames
 ├── consolidate_metadata.py  actions/*.jsonl + infos/*.json -> all_actions.json
-├── cluster_pipeline.py      Convert -> train -> evaluate (calls into above)
+├── cluster_pipeline.py      Train -> evaluate (calls into above)
 ├── run_rollout.py           Run trained agent (or random) in MineRL
 ├── eval_logger.py           Per-episode/per-run rollout metrics
 ├── slurm_train.sh           SLURM job that invokes cluster_pipeline.py
@@ -59,19 +59,21 @@ r1v-a/
 
 ## Data Layout
 
-`TrajectoryDataset` reads frames from HDF5 chunks and actions from either
-consolidated JSON or legacy per-video files:
+`TrajectoryDataset` reads frames directly from MP4 files (via `decord`) and
+actions from either consolidated JSON or legacy per-video files:
 
 ```
 trajectories/
-├── trajectory_task_<task>_length_<N>/
-│   ├── all_actions.json            # preferred — {"<stem>": [action, ...], ...}
-│   ├── all_infos.json              # optional  — {"<stem>": {info_dict}, ...}
-│   ├── actions/action_<stem>.jsonl # legacy fallback
-│   └── infos/info_<stem>.json      # legacy fallback
-└── frames_chunked/
-    └── video_<stem>.h5             # produced by chunk_frames.py
+└── trajectory_task_<task>_length_<N>/
+    ├── all_actions.json            # preferred — {"<stem>": [action, ...], ...}
+    ├── all_infos.json              # optional  — {"<stem>": {info_dict}, ...}
+    ├── videos/video_<stem>.mp4     # decoded on demand at __getitem__ time
+    ├── actions/action_<stem>.jsonl # legacy fallback
+    └── infos/info_<stem>.json      # legacy fallback
 ```
+
+Frames are no longer pre-extracted to HDF5. One `decord.VideoReader` is cached
+per DataLoader worker per file (bounded LRU, default 64 files per worker).
 
 `all_actions.json` (BASALT contractor format) wraps every value in a
 single-element list:
@@ -90,22 +92,17 @@ The env step format unwraps the lists: `{"attack": 1, "camera": [x, y], ...}`.
 
 ## Common Workflows
 
-### 1. Convert MP4 → HDF5
-```bash
-python chunk_frames.py --data-dir ./trajectories --skip-existing
-```
-
-### 2. Train (assumes HDF5 already present)
+### 1. Train (reads MP4s directly — no conversion step)
 ```bash
 python imitation_learning.py \
     --data-dir ./trajectories \
     --out-weights ./models/vla.pt \
     --epochs 10 --batch-size 16 --lr 1e-4 \
-    --num-workers 2 \
+    --num-workers 8 \
     --evaluate-after
 ```
 
-### 3. Full pipeline (convert + train + evaluate)
+### 2. Full pipeline (train + evaluate)
 ```bash
 python cluster_pipeline.py \
     --data-dir ./trajectories \
@@ -113,7 +110,7 @@ python cluster_pipeline.py \
     --epochs 10 --batch-size 16
 ```
 
-### 4. Roll out a trained agent in MineRL
+### 3. Roll out a trained agent in MineRL
 ```bash
 python run_rollout.py \
     --model-path ./models/vla.pt \
@@ -123,12 +120,12 @@ python run_rollout.py \
     --record-video
 ```
 
-### 5. SLURM
+### 4. SLURM
 ```bash
 sbatch slurm_train.sh   # wraps cluster_pipeline.py with module loads
 ```
 
-### 6. MineRL inside Docker (Apple Silicon-friendly)
+### 5. MineRL inside Docker (Apple Silicon-friendly)
 ```bash
 docker compose run --remove-orphans minerl test_minerl.py     # sanity check
 docker compose run --remove-orphans minerl run_rollout.py --episodes 1
@@ -183,14 +180,20 @@ is rebuilt from `llava_model`; the head is sized to `NUM_OUTPUT_LOGITS`.
 - Camera bin choices are fixed at training time. If the contractor data ever
   uses a different `camera_maxval`/`mu`, update `vpt_camera.DEFAULT_CAMERA_QUANTIZER`
   before training (the checkpoint stores the values for traceability).
-- HDF5 file handles are cached lazily per-DataLoader-worker; `num_workers > 0`
-  is fine but each worker holds its own handles.
+- `decord.VideoReader` handles are cached lazily per-DataLoader-worker (LRU,
+  default 64 files per worker). `num_workers > 0` is fine but each worker holds
+  its own readers — keep `decoder_cache_size * num_workers` below your fd limit.
+- Random MP4 seeks land on the nearest keyframe and decode forward, so
+  per-frame latency is ~3–5 ms (higher than the old HDF5 ~0.5 ms). For LLaVA-7B
+  forward at 30–100 ms/sample this is invisible under prefetching workers,
+  but if you ever swap in a much cheaper backbone, profile the dataloader.
 
 ## Dependencies
 
 Pinned in `requirements.txt` for the JURECA cluster (Python 3.10, torch 2.1.0
 + CUDA 11.7, transformers <4.45). MineRL v1.0 + gym 0.23.1 are required for the
-rollout path; everything else (training, conversion) only needs the ML stack.
+rollout path; everything else only needs the ML stack + `decord` for frame
+decoding.
 
 ## Tests
 
