@@ -52,18 +52,17 @@ class VLAAgent(nn.Module):
             nn.Linear(hidden, output_dim * chunk_size),
         )
 
-    def forward(self, images, texts, past_actions=None):
-        """Run a forward pass.
+    @property
+    def feature_dim(self) -> int:
+        """Width of the pooled LLaVA feature consumed by the head (pre past-action)."""
+        return self.action_head[0].in_features - self.past_action_dim
 
-        Returns logits of shape (B, chunk_size, output_dim). For the original
-        single-step head (`chunk_size=1`) this is (B, 1, output_dim); callers
-        that want the legacy 2-D shape can index `[:, 0, :]`.
+    def encode(self, images, texts) -> th.Tensor:
+        """Run the frozen backbone and return pooled (B, feature_dim) features.
 
-        Args:
-            images: list[PIL.Image] of length B
-            texts:  list[str] of length B (replaced with "" if use_language=False)
-            past_actions: optional (B, past_action_dim) float tensor. Required
-                iff past_action_dim > 0.
+        Exposed for the feature-caching pipeline so a separate script can
+        precompute LLaVA embeddings once and reuse them across many head-only
+        training runs.
         """
         effective_texts = texts if self.use_language else [""] * len(texts)
         prompts = [t if "<image>" in t else f"<image>\n{t}" for t in effective_texts]
@@ -86,7 +85,22 @@ class VLAAgent(nn.Module):
         # (image + text) sequence so the head sees both modalities.
         pooled = out.hidden_states[-1].mean(dim=1)
         head_dtype = self.action_head[0].weight.dtype
-        pooled = pooled.to(head_dtype)
+        return pooled.to(head_dtype)
+
+    def forward(self, images, texts, past_actions=None):
+        """Run a forward pass.
+
+        Returns logits of shape (B, chunk_size, output_dim). For the original
+        single-step head (`chunk_size=1`) this is (B, 1, output_dim); callers
+        that want the legacy 2-D shape can index `[:, 0, :]`.
+
+        Args:
+            images: list[PIL.Image] of length B
+            texts:  list[str] of length B (replaced with "" if use_language=False)
+            past_actions: optional (B, past_action_dim) float tensor. Required
+                iff past_action_dim > 0.
+        """
+        pooled = self.encode(images, texts)
 
         if self.past_action_dim > 0:
             if past_actions is None:
@@ -94,7 +108,7 @@ class VLAAgent(nn.Module):
                     "past_actions is required when past_action_dim > 0; "
                     f"got None (past_action_dim={self.past_action_dim})"
                 )
-            past = past_actions.to(pooled.device).to(head_dtype)
+            past = past_actions.to(pooled.device).to(pooled.dtype)
             pooled = th.cat([pooled, past], dim=-1)
 
         flat = self.action_head(pooled)  # (B, output_dim * chunk_size)

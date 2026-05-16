@@ -288,5 +288,45 @@ class VLALossShapeTests(unittest.TestCase):
         loss.backward()
 
 
+# ---------------------------------------------------------------------
+# Cached-feature pieces (HeadOnlyAgent + chunked vla_loss against its output)
+# ---------------------------------------------------------------------
+class HeadOnlyAgentTests(unittest.TestCase):
+    def test_forward_shape_no_past(self):
+        from feature_cache import HeadOnlyAgent
+
+        model = HeadOnlyAgent(
+            feature_dim=128,
+            output_dim=NUM_OUTPUT_LOGITS,
+            past_action_dim=0,
+            chunk_size=4,
+        )
+        feats = torch.randn(3, 128)
+        out = model(feats)
+        self.assertEqual(out.shape, (3, 4, NUM_OUTPUT_LOGITS))
+
+    def test_forward_shape_with_past(self):
+        from feature_cache import HeadOnlyAgent
+
+        past_dim = 8 * 43
+        model = HeadOnlyAgent(
+            feature_dim=128,
+            output_dim=NUM_OUTPUT_LOGITS,
+            past_action_dim=past_dim,
+            chunk_size=1,
+        )
+        feats = torch.randn(2, 128)
+        pasts = torch.randn(2, past_dim)
+        out = model(feats, pasts)
+        self.assertEqual(out.shape, (2, 1, NUM_OUTPUT_LOGITS))
+
+    def test_past_required_when_dim_nonzero(self):
+        from feature_cache import HeadOnlyAgent
+
+        model = HeadOnlyAgent(feature_dim=8, output_dim=NUM_OUTPUT_LOGITS, past_action_dim=10)
+        with self.assertRaises(ValueError):
+            model(torch.randn(1, 8))  # no past_actions passed
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -63,8 +63,9 @@ r1v-a/
 ├── constants.py             Canonical keys + action_to_tensor() + size constants
 ├── vpt_camera.py            CameraQuantizer (mu-law) — vendored from VPT
 ├── VLAAgent.py              Frozen LLaVA backbone + trainable MLP head
-├── frozen_vision_baseline.py  CLIP-only baseline (same forward signature)
-├── imitation_learning.py    TrajectoryDataset, vla_loss, train_vla, evaluate, CLI
+├── frozen_vision_baseline.py  CLIP image+text baseline (text branch zeroed when use_language=False)
+├── feature_cache.py         Precompute LLaVA/CLIP embeddings + CachedFeatureDataset + HeadOnlyAgent
+├── imitation_learning.py    TrajectoryDataset, vla_loss, train_vla, train_cached_head, evaluate, CLI
 ├── action_mapping.py        Logits -> MineRL action dict (argmax + undiscretize)
 ├── chunk_frames.py          (deprecated) MP4/PNG -> HDF5 chunked frames
 ├── consolidate_metadata.py  actions/*.jsonl + infos/*.json -> all_actions.json
@@ -133,6 +134,39 @@ python cluster_pipeline.py \
     --epochs 10 --batch-size 16 \
     --past-action-k 8 --chunk-size 8
 ```
+
+### 2b. Feature-cached training (recommended for ablation runs)
+
+End-to-end training repeats the frozen-backbone forward every epoch, which
+dominates wall time. Cache the pooled features once, then train MLP heads at
+~50 µs/sample:
+
+```bash
+# Step 1 — precompute one cache per (backbone × use_language × task).
+#         Cache file: <cache-dir>/<backbone>_<task>_<lang|nolang>.npy + .json
+python feature_cache.py --data-dir ./trajectories --cache-dir ./caches \
+    --backbone llava --task-filter chop_a_tree --use-language
+python feature_cache.py --data-dir ./trajectories --cache-dir ./caches \
+    --backbone llava --task-filter chop_a_tree --no-language
+python feature_cache.py --data-dir ./trajectories --cache-dir ./caches \
+    --backbone clip  --task-filter chop_a_tree --use-language
+python feature_cache.py --data-dir ./trajectories --cache-dir ./caches \
+    --backbone clip  --task-filter chop_a_tree --no-language
+# ... repeat for collect_dirt ...
+
+# Step 2 — train the MLP head against any cache (fast, ~30 min per condition).
+#         Uses train_cached_head() in imitation_learning.py.
+python -c "
+from imitation_learning import train_cached_head
+train_cached_head(
+    cache_dir='./caches', cache_tag='llava_chop_a_tree_lang',
+    data_root='./trajectories', out_weights='./models/exp1_llava_lang.pt',
+    epochs=10, batch_size=256, past_action_k=8, chunk_size=8,
+)"
+```
+
+One cache pass costs ~26 h per LLaVA tag / ~6 h per CLIP tag on A5000; all 8
+head-training runs together fit in a few hours. See "Compute budget" below.
 
 ### 3. Roll out a trained agent in MineRL
 ```bash
@@ -229,6 +263,32 @@ Pinned in `requirements.txt` for the JURECA cluster (Python 3.10, torch 2.1.0
 + CUDA 11.7, transformers <4.45). MineRL v1.0 + gym 0.23.1 are required for the
 rollout path; everything else only needs the ML stack + `decord` for frame
 decoding.
+
+## Compute budget
+
+For the 2×2 ablation (LLaVA/CLIP × language on/off) on both tasks with the
+full temporal recipe (past-action K=8, chunk N=8), 10 epochs each:
+
+|                  | Per-sample fwd | Per epoch / task | All 8 runs |
+|------------------|---------------:|-----------------:|-----------:|
+| End-to-end LLaVA |          ~30 ms |             26 h |     ~520 h |
+| End-to-end CLIP  |           ~7 ms |              6 h |     ~120 h |
+| **Total end-to-end (1 task)** |     |              | **~640 h** |
+| **Total end-to-end (2 tasks)** |    |              | **~1280 h (~53 days)** |
+
+With `feature_cache.precompute` running first:
+
+|                       | One-time cache build | Head training (10 ep) |
+|-----------------------|---------------------:|----------------------:|
+| 4 LLaVA caches × 26 h |               ~104 h |                  ~2 h |
+| 4 CLIP caches × 6 h   |                ~24 h |                  ~2 h |
+| **Total with caching, 2 tasks** | **~128 h (~5.3 days)** | **~4 h** |
+
+Cache storage: ~25 GB per LLaVA tag (FP16 × 4096 dims) + ~10 GB per CLIP tag
+(FP16 × ~1536 dims) ≈ **140 GB total** — fits the 2 TB NVMe easily.
+
+Per-sample times are public-benchmark estimates for A5000 + FP16; expect
+±50%. Measure on one mini-run before committing.
 
 ## Tests
 

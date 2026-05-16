@@ -467,6 +467,193 @@ def train_vla(
 
 
 # ---------------------------------------------------------------------
+# Cached-feature training (used after `feature_cache.precompute`)
+# ---------------------------------------------------------------------
+def _cached_collate(batch):
+    feats, targets, pasts = zip(*batch)
+    return th.stack(feats), th.stack(targets), th.stack(pasts)
+
+
+def train_cached_head(
+    cache_dir: str,
+    cache_tag: str,
+    data_root: str,
+    out_weights: str,
+    batch_size: int = 256,
+    epochs: int = 10,
+    lr: float = 1e-3,
+    device: str = "cuda" if th.cuda.is_available() else "cpu",
+    val_split: float = 0.1,
+    test_split: float = 0.1,
+    num_workers: int = 2,
+    past_action_k: int = DEFAULT_PAST_ACTION_K,
+    chunk_size: int = 1,
+    hidden_dim: int | None = None,
+):
+    """Train an MLP head on precomputed backbone features.
+
+    The cache must have been produced by `feature_cache.precompute(...)` with
+    the matching task_filter and use_language settings. Past-action / chunk
+    knobs are head-only and don't need cache regeneration.
+
+    Returns (head, test_subset, history).
+    """
+    from feature_cache import CachedFeatureDataset, HeadOnlyAgent
+
+    device = _resolve_device(device)
+    _print_device_info(device)
+
+    dataset = CachedFeatureDataset(
+        cache_dir=cache_dir,
+        tag=cache_tag,
+        data_root=data_root,
+        past_action_k=past_action_k,
+        chunk_size=chunk_size,
+    )
+    print(
+        f"Cached dataset: {len(dataset):,} samples  "
+        f"(tag={cache_tag}  past_action_k={past_action_k}  chunk_size={chunk_size})"
+    )
+
+    test_size = int(len(dataset) * test_split)
+    val_size = int(len(dataset) * val_split)
+    train_size = len(dataset) - val_size - test_size
+    train_set, val_set, test_set = random_split(
+        dataset,
+        [train_size, val_size, test_size],
+        generator=th.Generator().manual_seed(42),
+    )
+
+    out_path = Path(out_weights)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    train_loader = DataLoader(
+        train_set,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        collate_fn=_cached_collate,
+        persistent_workers=num_workers > 0,
+    )
+    val_loader = DataLoader(
+        val_set,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        collate_fn=_cached_collate,
+        persistent_workers=num_workers > 0,
+    )
+
+    past_action_dim = past_action_k * PAST_ACTION_DIM
+    model = HeadOnlyAgent(
+        feature_dim=dataset.feature_dim(),
+        output_dim=NUM_OUTPUT_LOGITS,
+        past_action_dim=past_action_dim,
+        chunk_size=chunk_size,
+        hidden_dim=hidden_dim,
+    ).to(device)
+    optim = th.optim.Adam(model.parameters(), lr=lr)
+
+    history: dict[str, list[float]] = {
+        "train_loss": [], "train_bce": [], "train_cam_ce": [],
+        "val_loss": [], "val_bce": [], "val_cam_ce": [],
+        "val_binary_acc": [], "val_cam_bin_acc": [],
+    }
+
+    for ep in range(epochs):
+        model.train()
+        train_total = train_bce = train_cam = 0.0
+        for feats, acts, pasts in train_loader:
+            feats = feats.to(device)
+            acts = acts.to(device)
+            pasts = pasts.to(device)
+            optim.zero_grad()
+            logits = model(feats, pasts)
+            loss, bce_v, cam_v = vla_loss(logits, acts)
+            loss.backward()
+            optim.step()
+            train_total += loss.item()
+            train_bce += bce_v
+            train_cam += cam_v
+        n_train = len(train_loader)
+        history["train_loss"].append(train_total / n_train)
+        history["train_bce"].append(train_bce / n_train)
+        history["train_cam_ce"].append(train_cam / n_train)
+
+        model.eval()
+        val_total = val_bce = val_cam = 0.0
+        binary_correct = binary_seen = 0
+        cam_correct = cam_seen = 0
+        with th.no_grad():
+            for feats, acts, pasts in val_loader:
+                feats = feats.to(device)
+                acts = acts.to(device)
+                pasts = pasts.to(device)
+                logits = model(feats, pasts)
+                loss, bce_v, cam_v = vla_loss(logits, acts)
+                val_total += loss.item()
+                val_bce += bce_v
+                val_cam += cam_v
+                logits_flat = logits.reshape(-1, logits.size(-1))
+                acts_flat = acts.reshape(-1, acts.size(-1))
+                preds = (th.sigmoid(logits_flat[:, :NUM_BINARY]) > 0.5).float()
+                binary_correct += (preds == acts_flat[:, :NUM_BINARY]).sum().item()
+                binary_seen += preds.numel()
+                cam_x_pred = logits_flat[:, _CAM_X_SLICE].argmax(dim=-1)
+                cam_y_pred = logits_flat[:, _CAM_Y_SLICE].argmax(dim=-1)
+                cam_correct += (cam_x_pred == acts_flat[:, NUM_BINARY].long()).sum().item()
+                cam_correct += (cam_y_pred == acts_flat[:, NUM_BINARY + 1].long()).sum().item()
+                cam_seen += 2 * cam_x_pred.numel()
+        n_val = max(len(val_loader), 1)
+        history["val_loss"].append(val_total / n_val)
+        history["val_bce"].append(val_bce / n_val)
+        history["val_cam_ce"].append(val_cam / n_val)
+        history["val_binary_acc"].append(binary_correct / max(binary_seen, 1))
+        history["val_cam_bin_acc"].append(cam_correct / max(cam_seen, 1))
+
+        print(
+            f"Epoch {ep + 1}/{epochs}  "
+            f"train_loss={history['train_loss'][-1]:.4f}  "
+            f"val_loss={history['val_loss'][-1]:.4f}  "
+            f"bin_acc={history['val_binary_acc'][-1]:.4f}  "
+            f"cam_acc={history['val_cam_bin_acc'][-1]:.4f}"
+        )
+
+    th.save(
+        {
+            "cache_tag": cache_tag,
+            "state_dict": model.state_dict(),
+            "training_metrics": history,
+            "config": {
+                "feature_dim": dataset.feature_dim(),
+                "num_actions": NUM_ACTIONS,
+                "num_binary": NUM_BINARY,
+                "num_camera": NUM_CAMERA,
+                "num_camera_bins": NUM_CAMERA_BINS,
+                "num_output_logits": NUM_OUTPUT_LOGITS,
+                "past_action_k": past_action_k,
+                "past_action_dim": past_action_dim,
+                "chunk_size": chunk_size,
+                "hidden_dim": model.hidden_dim,
+                "epochs": epochs,
+                "batch_size": batch_size,
+                "lr": lr,
+                "val_split": val_split,
+                "test_split": test_split,
+                "camera_quantizer": {
+                    "camera_maxval": DEFAULT_CAMERA_QUANTIZER.camera_maxval,
+                    "camera_binsize": DEFAULT_CAMERA_QUANTIZER.camera_binsize,
+                    "mu": DEFAULT_CAMERA_QUANTIZER.mu,
+                },
+            },
+        },
+        out_weights,
+    )
+    print(f"Cached-head training complete. Saved to: {out_weights}")
+    return model, test_set, history
+
+
+# ---------------------------------------------------------------------
 # Evaluation
 # ---------------------------------------------------------------------
 def evaluate(
