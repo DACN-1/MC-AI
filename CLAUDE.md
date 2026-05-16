@@ -25,8 +25,27 @@ NUM_BINARY        = 21        binary actions
 NUM_CAMERA        = 2         camera axes
 NUM_ACTIONS       = 23        canonical action keys (env-facing)
 NUM_CAMERA_BINS   = 11        bins per camera axis
-NUM_OUTPUT_LOGITS = 43        VLAAgent output dim = 21 + 2 * 11
+NUM_OUTPUT_LOGITS = 43        per-chunk-step head logits = 21 + 2 * 11
+PAST_ACTION_DIM   = 43        per-action feature dim (binary + 2 one-hots)
 ```
+
+## Temporal context (optional)
+
+Two independent flags add temporal context to the head, both default off so
+that single-frame / single-step is the baseline:
+
+- `--past-action-k K` (`DEFAULT_PAST_ACTION_K = 8`): concatenate the last K
+  actions, one-hot encoded (`PAST_ACTION_DIM` each), to the head input. Zero-
+  padded for the first K frames of each trajectory. Most-recent action is
+  always at the last slot so the head's positional reading is stable.
+- `--chunk-size N`: the head predicts the next N actions in one forward.
+  Output tensor shape becomes `(B, N, NUM_OUTPUT_LOGITS)`. Loss averages over
+  the chunk axis. Last `N-1` frames per trajectory are dropped (no full
+  target). Inference (`run_rollout.py`) executes only the first predicted step
+  and re-plans next tick.
+
+Both interventions compose cleanly with `--no-language` (zeroes the text
+prompt), forming a 2×2×2 ablation space: language × past-action × chunking.
 
 The camera quantizer matches the BASALT contractor recordings exactly:
 `CameraQuantizer(camera_maxval=10, camera_binsize=2, mu=10)`. The recorded
@@ -99,15 +118,20 @@ python imitation_learning.py \
     --out-weights ./models/vla.pt \
     --epochs 10 --batch-size 16 --lr 1e-4 \
     --num-workers 8 \
+    --past-action-k 8 --chunk-size 8 \
     --evaluate-after
 ```
+
+Add `--no-language` to zero the text prompt; set `--past-action-k 0` and
+`--chunk-size 1` for the no-temporal baseline.
 
 ### 2. Full pipeline (train + evaluate)
 ```bash
 python cluster_pipeline.py \
     --data-dir ./trajectories \
     --output-dir ./output \
-    --epochs 10 --batch-size 16
+    --epochs 10 --batch-size 16 \
+    --past-action-k 8 --chunk-size 8
 ```
 
 ### 3. Roll out a trained agent in MineRL
@@ -136,6 +160,10 @@ docker compose run --remove-orphans minerl run_rollout.py --episodes 1
 `imitation_learning.vla_loss(logits, targets)` returns
 `(BCE_on_binary + 0.5*(CE_on_camera_x + CE_on_camera_y), bce_value, camera_ce_value)`.
 
+Accepts both 2-D `(B, NUM_OUTPUT_LOGITS)` and 3-D `(B, chunk_size, NUM_OUTPUT_LOGITS)`
+logits — the chunk axis is flattened, so every chunk step contributes equally.
+Targets follow the same convention.
+
 Camera was previously regressed with MSE on raw degrees, which collapsed to
 near-zero predictions on the heavily zero-inflated demonstrator distribution.
 Categorical cross-entropy on mu-law bins lets the model represent the bimodal
@@ -163,6 +191,8 @@ th.save({
     "config": {
         "num_actions": ..., "num_binary": ..., "num_camera": ...,
         "num_camera_bins": ..., "num_output_logits": ...,
+        "past_action_k": ..., "past_action_dim": ..., "chunk_size": ...,
+        "use_language": ...,
         "camera_quantizer": {"camera_maxval": 10, "camera_binsize": 2, "mu": 10},
         ...
     }
@@ -170,11 +200,16 @@ th.save({
 ```
 
 `run_rollout._load_agent(path, device)` is the canonical loader. The backbone
-is rebuilt from `llava_model`; the head is sized to `NUM_OUTPUT_LOGITS`.
+is rebuilt from `llava_model`; head input dim is `hidden + past_action_dim`
+and head output is `NUM_OUTPUT_LOGITS * chunk_size`. Pre-temporal checkpoints
+(no `past_action_k` / `chunk_size` in config) load with defaults 0 and 1.
 
 ## Known Limitations
 
-- Frames are processed independently — the model has no temporal context.
+- Temporal context is *off by default*. With `--past-action-k 0 --chunk-size 1`
+  the model has no history at all — useful as a baseline cell but expect
+  weak performance on sticky-action tasks (attack runs, walking, camera tracking).
+  Turn on `--past-action-k 8 --chunk-size 8` for the full temporal model.
 - LLaMA has no CLS token, so the head pools the **mean** of the last hidden
   state across all (image + text) tokens.
 - Camera bin choices are fixed at training time. If the contractor data ever

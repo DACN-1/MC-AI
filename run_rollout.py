@@ -3,6 +3,7 @@
 import argparse
 import json
 import os
+from collections import deque
 
 import cv2
 import gym
@@ -13,12 +14,20 @@ from PIL import Image
 
 from VLAAgent import VLAAgent
 from action_mapping import map_to_minerl_action
-from constants import NUM_OUTPUT_LOGITS
+from constants import (
+    NUM_OUTPUT_LOGITS,
+    PAST_ACTION_DIM,
+    action_to_onehot,
+)
 from eval_logger import EpisodeLogger
 
 
-def _load_agent(model_path: str, device: str) -> VLAAgent:
-    """Load a VLA checkpoint produced by imitation_learning.train_vla."""
+def _load_agent(model_path: str, device: str) -> tuple[VLAAgent, dict]:
+    """Load a VLA checkpoint produced by imitation_learning.train_vla.
+
+    Returns (agent, config) — config carries past_action_k / chunk_size /
+    use_language so the rollout loop can match training-time conditioning.
+    """
     ckpt = torch.load(model_path, map_location="cpu")
     if not isinstance(ckpt, dict) or "state_dict" not in ckpt:
         raise ValueError(
@@ -26,11 +35,25 @@ def _load_agent(model_path: str, device: str) -> VLAAgent:
             "(missing 'state_dict' key). Expected a dict produced by train_vla()."
         )
     backbone = ckpt.get("llava_model", "llava-hf/llava-1.5-7b-hf")
-    agent = VLAAgent(output_dim=NUM_OUTPUT_LOGITS, backbone=backbone)
+    cfg = ckpt.get("config", {})
+    past_action_k = cfg.get("past_action_k", 0)
+    chunk_size = cfg.get("chunk_size", 1)
+    use_language = cfg.get("use_language", True)
+    agent = VLAAgent(
+        output_dim=NUM_OUTPUT_LOGITS,
+        backbone=backbone,
+        use_language=use_language,
+        past_action_dim=past_action_k * PAST_ACTION_DIM,
+        chunk_size=chunk_size,
+    )
     agent.action_head.load_state_dict(ckpt["state_dict"])
     agent = agent.to(device)
     agent.eval()
-    return agent
+    return agent, {
+        "past_action_k": past_action_k,
+        "chunk_size": chunk_size,
+        "use_language": use_language,
+    }
 
 
 def _obs_to_pil(obs: dict) -> Image.Image:
@@ -77,7 +100,11 @@ def run(args: argparse.Namespace) -> None:
     logger = EpisodeLogger(output_dir=args.output_dir)
 
     device = _resolve_device(args.device)
-    agent = _load_agent(args.model_path, device) if args.model_path else None
+    if args.model_path:
+        agent, agent_cfg = _load_agent(args.model_path, device)
+    else:
+        agent, agent_cfg = None, {"past_action_k": 0, "chunk_size": 1, "use_language": True}
+    past_action_k = agent_cfg["past_action_k"]
 
     env = gym.make(args.env)
     # Captured once: gives us the canonical key set including pickItem/swapHands,
@@ -94,6 +121,13 @@ def run(args: argparse.Namespace) -> None:
         obs = env.reset()
         step_log = []
 
+        # Per-episode past-action buffer (zero-padded at start). One-hot
+        # encodings (PAST_ACTION_DIM each) of the most recent K env actions.
+        past_buffer: deque = deque(
+            [np.zeros(PAST_ACTION_DIM, dtype=np.float32) for _ in range(past_action_k)],
+            maxlen=past_action_k,
+        )
+
         writer = None
         if args.record_video:
             first_frame = obs["pov"]
@@ -106,10 +140,21 @@ def run(args: argparse.Namespace) -> None:
         for step in range(args.max_steps):
             if agent is not None:
                 img = _obs_to_pil(obs)
+                if past_action_k > 0:
+                    past_tensor = torch.from_numpy(
+                        np.concatenate(list(past_buffer))
+                    ).unsqueeze(0)
+                else:
+                    past_tensor = torch.zeros(1, 0)
                 with torch.no_grad():
-                    logits = agent([img], [args.prompt])[0]
+                    # Model returns (1, chunk_size, NUM_OUTPUT_LOGITS); execute
+                    # only the first predicted step and replan next tick.
+                    chunk_logits = agent([img], [args.prompt], past_tensor)
+                    logits = chunk_logits[0, 0]
                 minerl_action = map_to_minerl_action(logits, base_action=no_op_template)
                 action_vec = logits.detach().cpu().tolist()
+                if past_action_k > 0:
+                    past_buffer.append(action_to_onehot(minerl_action))
             else:
                 minerl_action = _random_action(env)
                 action_vec = []

@@ -63,6 +63,13 @@ NUM_CAMERA_BINS = DEFAULT_CAMERA_QUANTIZER.n_bins  # 11
 CAMERA_NULL_BIN = DEFAULT_CAMERA_QUANTIZER.null_bin  # 5
 NUM_OUTPUT_LOGITS = NUM_BINARY + NUM_CAMERA * NUM_CAMERA_BINS  # 43
 
+# Past-action conditioning: a single action represented for the action-head
+# input. Binary actions stay as 0/1 (NUM_BINARY dims); each camera axis becomes
+# a one-hot over NUM_CAMERA_BINS. Coincidentally equal to NUM_OUTPUT_LOGITS but
+# named separately because it serves a different role (input vs. output).
+PAST_ACTION_DIM = NUM_BINARY + 2 * NUM_CAMERA_BINS  # 43
+DEFAULT_PAST_ACTION_K = 8
+
 
 def _unwrap_scalar(value):
     """Contractor data wraps every value in a single-element list (`[1]` / `[0]`).
@@ -114,3 +121,24 @@ def action_to_tensor(action_dict) -> th.Tensor:
     vec[NUM_BINARY] = float(bins[0])
     vec[NUM_BINARY + 1] = float(bins[1])
     return th.from_numpy(vec)
+
+
+def action_to_onehot(action_dict) -> np.ndarray:
+    """Encode an action as a flat one-hot feature for past-action conditioning.
+
+    Layout (PAST_ACTION_DIM = NUM_BINARY + 2 * NUM_CAMERA_BINS = 43):
+      [0 .. NUM_BINARY)                                     binary actions (0/1)
+      [NUM_BINARY .. NUM_BINARY + NUM_CAMERA_BINS)          camera_x one-hot
+      [NUM_BINARY + NUM_CAMERA_BINS .. PAST_ACTION_DIM)     camera_y one-hot
+
+    Identical layout to the model's output logits — by design, so the head can
+    learn from a vector that "looks like" what it produces.
+    """
+    base = action_to_tensor(action_dict).numpy()
+    cam_x_bin = int(base[NUM_BINARY])
+    cam_y_bin = int(base[NUM_BINARY + 1])
+    out = np.zeros(PAST_ACTION_DIM, dtype=np.float32)
+    out[:NUM_BINARY] = base[:NUM_BINARY]
+    out[NUM_BINARY + cam_x_bin] = 1.0
+    out[NUM_BINARY + NUM_CAMERA_BINS + cam_y_bin] = 1.0
+    return out

@@ -17,6 +17,8 @@ from constants import (  # noqa: E402
     NUM_BINARY,
     NUM_CAMERA_BINS,
     NUM_OUTPUT_LOGITS,
+    PAST_ACTION_DIM,
+    action_to_onehot,
     action_to_tensor,
 )
 from vpt_camera import DEFAULT_CAMERA_QUANTIZER  # noqa: E402
@@ -213,6 +215,42 @@ class MapToMineRLActionTests(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------
+# action_to_onehot — past-action feature encoding
+# ---------------------------------------------------------------------
+class ActionToOnehotTests(unittest.TestCase):
+    def test_shape(self):
+        oh = action_to_onehot({})
+        self.assertEqual(oh.shape, (PAST_ACTION_DIM,))
+        self.assertEqual(oh.dtype, np.float32)
+
+    def test_zero_action_camera_one_hot_at_null_bin(self):
+        oh = action_to_onehot({})
+        # binary portion is all zero
+        self.assertTrue(np.all(oh[:NUM_BINARY] == 0.0))
+        # camera_x one-hot peaked at CAMERA_NULL_BIN
+        cam_x = oh[NUM_BINARY : NUM_BINARY + NUM_CAMERA_BINS]
+        self.assertEqual(int(cam_x.argmax()), CAMERA_NULL_BIN)
+        self.assertEqual(cam_x.sum(), 1.0)
+        # camera_y one-hot peaked at CAMERA_NULL_BIN
+        cam_y = oh[NUM_BINARY + NUM_CAMERA_BINS :]
+        self.assertEqual(int(cam_y.argmax()), CAMERA_NULL_BIN)
+        self.assertEqual(cam_y.sum(), 1.0)
+
+    def test_binary_and_camera_encoding(self):
+        action = {"attack": [1], "forward": [1], "camera": [[1.6094986352788734, -10.0]]}
+        oh = action_to_onehot(action)
+        idx_attack = BINARY_ACTION_KEYS.index("attack")
+        idx_forward = BINARY_ACTION_KEYS.index("forward")
+        self.assertEqual(oh[idx_attack], 1.0)
+        self.assertEqual(oh[idx_forward], 1.0)
+        # camera_x = 1.609 -> bin 7,  camera_y = -10.0 -> bin 0
+        cam_x = oh[NUM_BINARY : NUM_BINARY + NUM_CAMERA_BINS]
+        cam_y = oh[NUM_BINARY + NUM_CAMERA_BINS :]
+        self.assertEqual(int(cam_x.argmax()), 7)
+        self.assertEqual(int(cam_y.argmax()), 0)
+
+
+# ---------------------------------------------------------------------
 # vla_loss shape sanity
 # ---------------------------------------------------------------------
 class VLALossShapeTests(unittest.TestCase):
@@ -232,6 +270,22 @@ class VLALossShapeTests(unittest.TestCase):
         self.assertGreaterEqual(bce, 0.0)
         self.assertGreaterEqual(cam_ce, 0.0)
         loss.backward()  # should not raise
+
+    def test_loss_accepts_chunked_inputs(self):
+        from imitation_learning import vla_loss
+
+        B, N = 4, 8
+        logits = torch.randn(B, N, NUM_OUTPUT_LOGITS, requires_grad=True)
+        targets = torch.zeros(B, N, NUM_BINARY + 2)
+        targets[:, :, :NUM_BINARY] = (torch.rand(B, N, NUM_BINARY) > 0.7).float()
+        targets[:, :, NUM_BINARY] = torch.randint(0, NUM_CAMERA_BINS, (B, N)).float()
+        targets[:, :, NUM_BINARY + 1] = torch.randint(0, NUM_CAMERA_BINS, (B, N)).float()
+
+        loss, bce, cam_ce = vla_loss(logits, targets)
+        self.assertEqual(loss.dim(), 0)
+        self.assertGreaterEqual(bce, 0.0)
+        self.assertGreaterEqual(cam_ce, 0.0)
+        loss.backward()
 
 
 if __name__ == "__main__":
