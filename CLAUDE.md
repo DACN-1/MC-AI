@@ -178,10 +178,29 @@ python run_rollout.py \
     --record-video
 ```
 
-### 4. SLURM
+### 4. SLURM (one job per ablation cell)
+
+`slurm_train.sh` runs `cluster_pipeline.py` for one (backbone × task × language)
+cell. Selectors come from env vars; the first job for a given cell builds the
+cache (~26 h LLaVA, ~6 h CLIP), every subsequent job for the same cell reuses
+it and finishes in ~30 min of head training. Drop `--time` to 04:00:00 once
+all caches exist.
+
 ```bash
-sbatch slurm_train.sh   # wraps cluster_pipeline.py with module loads
+# Build cache + train one cell (LLaVA + chop_a_tree + prompt)
+BACKBONE=llava TASK_FILTER=chop_a_tree USE_LANGUAGE=1 sbatch slurm_train.sh
+
+# All 8 cells of the 2x2 x 2 tasks ablation:
+for backbone in llava clip; do
+  for task in chop_a_tree collect_dirt; do
+    for lang in 1 0; do
+      BACKBONE=$backbone TASK_FILTER=$task USE_LANGUAGE=$lang sbatch slurm_train.sh
+    done
+  done
+done
 ```
+
+Output is auto-tagged: `output/<backbone>_<task>_<lang|nolang>/{model.pt, metrics.json}`.
 
 ### 5. MineRL inside Docker (Apple Silicon-friendly)
 ```bash

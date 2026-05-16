@@ -653,6 +653,97 @@ def train_cached_head(
     return model, test_set, history
 
 
+def evaluate_cached(
+    model,
+    test_set,
+    device: str,
+    output_dir: Path,
+    batch_size: int = 256,
+    num_workers: int = 2,
+) -> dict:
+    """Run per-action metrics on a HeadOnlyAgent + CachedFeatureDataset split."""
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    loader = DataLoader(
+        test_set,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        collate_fn=_cached_collate,
+        persistent_workers=num_workers > 0,
+    )
+    model.eval()
+    binary_preds: list[th.Tensor] = []
+    binary_targets: list[th.Tensor] = []
+    cam_x_pred_bins: list[th.Tensor] = []
+    cam_y_pred_bins: list[th.Tensor] = []
+    cam_x_target_bins: list[th.Tensor] = []
+    cam_y_target_bins: list[th.Tensor] = []
+
+    with th.no_grad():
+        for feats, acts, pasts in loader:
+            feats = feats.to(device)
+            acts = acts.to(device)
+            pasts = pasts.to(device)
+            logits = model(feats, pasts)
+            logits_flat = logits.reshape(-1, logits.size(-1))
+            acts_flat = acts.reshape(-1, acts.size(-1))
+            binary_preds.append((th.sigmoid(logits_flat[:, :NUM_BINARY]) > 0.5).float().cpu())
+            binary_targets.append(acts_flat[:, :NUM_BINARY].cpu())
+            cam_x_pred_bins.append(logits_flat[:, _CAM_X_SLICE].argmax(dim=-1).cpu())
+            cam_y_pred_bins.append(logits_flat[:, _CAM_Y_SLICE].argmax(dim=-1).cpu())
+            cam_x_target_bins.append(acts_flat[:, NUM_BINARY].long().cpu())
+            cam_y_target_bins.append(acts_flat[:, NUM_BINARY + 1].long().cpu())
+
+    binary_preds_t = th.cat(binary_preds).numpy()
+    binary_targets_t = th.cat(binary_targets).numpy()
+    cam_x_pred = th.cat(cam_x_pred_bins).numpy()
+    cam_y_pred = th.cat(cam_y_pred_bins).numpy()
+    cam_x_target = th.cat(cam_x_target_bins).numpy()
+    cam_y_target = th.cat(cam_y_target_bins).numpy()
+
+    binary_accuracy = float((binary_preds_t == binary_targets_t).mean())
+    cam_x_acc = float((cam_x_pred == cam_x_target).mean())
+    cam_y_acc = float((cam_y_pred == cam_y_target).mean())
+
+    cam_x_pred_deg = DEFAULT_CAMERA_QUANTIZER.undiscretize(cam_x_pred)
+    cam_y_pred_deg = DEFAULT_CAMERA_QUANTIZER.undiscretize(cam_y_pred)
+    cam_x_target_deg = DEFAULT_CAMERA_QUANTIZER.undiscretize(cam_x_target)
+    cam_y_target_deg = DEFAULT_CAMERA_QUANTIZER.undiscretize(cam_y_target)
+    camera_mae_degrees = float(
+        0.5 * (
+            np.abs(cam_x_pred_deg - cam_x_target_deg).mean()
+            + np.abs(cam_y_pred_deg - cam_y_target_deg).mean()
+        )
+    )
+
+    per_action: dict[str, dict] = {}
+    for i, key in enumerate(BINARY_ACTION_KEYS):
+        p, r, f1, _ = precision_recall_fscore_support(
+            binary_targets_t[:, i], binary_preds_t[:, i], average="binary", zero_division=0
+        )
+        per_action[key] = {"precision": float(p), "recall": float(r), "f1": float(f1)}
+
+    metrics = {
+        "test_samples": int(binary_preds_t.shape[0]),
+        "binary_accuracy": binary_accuracy,
+        "camera_x_bin_accuracy": cam_x_acc,
+        "camera_y_bin_accuracy": cam_y_acc,
+        "camera_mae_degrees": camera_mae_degrees,
+        "per_action_metrics": per_action,
+    }
+
+    metrics_path = output_dir / "metrics.json"
+    with metrics_path.open("w") as f:
+        json.dump(metrics, f, indent=2)
+    print(f"Metrics saved: {metrics_path}")
+    print(f"  Binary accuracy: {binary_accuracy:.4f}")
+    print(f"  Camera bin accuracy:  x={cam_x_acc:.4f}  y={cam_y_acc:.4f}")
+    print(f"  Camera MAE (degrees): {camera_mae_degrees:.4f}")
+    return metrics
+
+
 # ---------------------------------------------------------------------
 # Evaluation
 # ---------------------------------------------------------------------
