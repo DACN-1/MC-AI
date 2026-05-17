@@ -128,6 +128,23 @@ def _decoder(path: str, cache: OrderedDict, VideoReader, cache_size: int = 64):
     return dec
 
 
+def _read_progress(progress_path: Path) -> int:
+    """Atomic-safe read; returns 0 on missing/partial file."""
+    if not progress_path.exists():
+        return 0
+    try:
+        return int(progress_path.read_text().strip() or "0")
+    except (ValueError, OSError):
+        return 0
+
+
+def _write_progress(progress_path: Path, value: int) -> None:
+    """POSIX-atomic write so the file is never half-written on crash."""
+    tmp = progress_path.with_suffix(progress_path.suffix + ".tmp")
+    tmp.write_text(str(value))
+    tmp.replace(progress_path)
+
+
 def precompute(
     data_root: str | Path,
     cache_dir: str | Path,
@@ -138,8 +155,17 @@ def precompute(
     batch_size: int = 16,
     device: str = "cuda" if th.cuda.is_available() else "cpu",
     tag: str | None = None,
+    progress_interval: int = 100,
 ) -> Path:
-    """Compute and write a feature cache. Returns the .npy path."""
+    """Compute and write a feature cache. Returns the .npy path.
+
+    Resumable: if the cache files exist from a previous run *and* metadata
+    matches the current request (same backbone, use_language, sample list,
+    feature_dim), encoding resumes from the last checkpointed sample. The
+    `<tag>.progress` sidecar records that cursor; it's written atomically
+    every `progress_interval` batches so a crash loses at most that many
+    batches of work.
+    """
     cache_dir = Path(cache_dir)
     cache_dir.mkdir(parents=True, exist_ok=True)
     samples = enumerate_samples(data_root, task_filter=task_filter)
@@ -152,6 +178,7 @@ def precompute(
         tag = f"{backbone}_{task_part}_{lang_part}"
     cache_path = cache_dir / f"{tag}.npy"
     meta_path = cache_dir / f"{tag}.json"
+    progress_path = cache_dir / f"{tag}.progress"
 
     try:
         from decord import VideoReader
@@ -159,28 +186,80 @@ def precompute(
         raise ImportError("decord required for video decoding. pip install decord") from e
 
     agent = _build_backbone(backbone, llava_id, use_language, device)
-    # Probe feature_dim by encoding one sample
+    # Probe feature_dim by encoding one sample (cheap; also needed to validate
+    # resume against any prior cache file).
     with th.no_grad():
         mp4_path, frame_idx, task_text, _stem = samples[0]
         vr = VideoReader(mp4_path, num_threads=1)
         probe_img = Image.fromarray(vr[frame_idx].asnumpy())
         probe_feat = agent.encode([probe_img], [task_text])
     feature_dim = int(probe_feat.shape[-1])
+
+    # Decide whether to resume or start fresh. The metadata file must exist
+    # AND match the requested cell exactly — any mismatch (different sample
+    # ordering, different feature_dim, ...) means the on-disk cache is stale.
+    resume = False
+    start_batch = 0
+    if cache_path.exists() and meta_path.exists():
+        with meta_path.open() as fp:
+            meta_existing = json.load(fp)
+        matches = (
+            meta_existing.get("n_samples") == len(samples)
+            and meta_existing.get("feature_dim") == feature_dim
+            and meta_existing.get("backbone") == backbone
+            and meta_existing.get("use_language") == use_language
+            and meta_existing.get("task_filter") == task_filter
+        )
+        if matches:
+            start_batch = _read_progress(progress_path)
+            if start_batch >= len(samples):
+                print(f"[{tag}] already complete ({start_batch:,}/{len(samples):,})")
+                return cache_path
+            resume = True
+            print(
+                f"[{tag}] resuming from sample {start_batch:,}/{len(samples):,} "
+                f"({100 * start_batch / len(samples):.1f}% done)"
+            )
+        else:
+            print(f"[{tag}] cache metadata mismatch — rebuilding from scratch")
+
+    if not resume:
+        # Write metadata up-front so a future resume can validate against it.
+        meta = {
+            "tag": tag,
+            "backbone": backbone,
+            "llava_id": llava_id if backbone == "llava" else None,
+            "use_language": use_language,
+            "task_filter": task_filter,
+            "n_samples": len(samples),
+            "feature_dim": feature_dim,
+            "dtype": "float16",
+            "samples": [[stem, frame_idx] for (_, frame_idx, _, stem) in samples],
+        }
+        with meta_path.open("w") as fp:
+            json.dump(meta, fp)
+        _write_progress(progress_path, 0)
+        start_batch = 0
+
     print(f"[{tag}] N={len(samples):,}  feature_dim={feature_dim}  device={device}")
 
     # FP16 storage: half the disk for negligible BC accuracy impact.
+    # 'r+' on resume preserves existing contents; 'w+' truncates for a fresh build.
     mm = np.memmap(
         cache_path,
         dtype=np.float16,
-        mode="w+",
+        mode="r+" if resume else "w+",
         shape=(len(samples), feature_dim),
     )
     decoder_cache: OrderedDict = OrderedDict()
 
     with th.no_grad():
+        batches_since_flush = 0
         for batch_start in tqdm(
-            range(0, len(samples), batch_size),
+            range(start_batch, len(samples), batch_size),
             desc=f"encoding {tag}",
+            initial=start_batch // batch_size,
+            total=(len(samples) + batch_size - 1) // batch_size,
         ):
             batch = samples[batch_start : batch_start + batch_size]
             imgs: list[Image.Image] = []
@@ -191,23 +270,15 @@ def precompute(
                 texts.append(task_text)
             feats = agent.encode(imgs, texts).detach().cpu().to(th.float16).numpy()
             mm[batch_start : batch_start + len(batch)] = feats
+            batches_since_flush += 1
+            if batches_since_flush >= progress_interval:
+                mm.flush()
+                _write_progress(progress_path, batch_start + len(batch))
+                batches_since_flush = 0
 
     mm.flush()
     del mm
-
-    meta = {
-        "tag": tag,
-        "backbone": backbone,
-        "llava_id": llava_id if backbone == "llava" else None,
-        "use_language": use_language,
-        "task_filter": task_filter,
-        "n_samples": len(samples),
-        "feature_dim": feature_dim,
-        "dtype": "float16",
-        "samples": [[stem, frame_idx] for (_, frame_idx, _, stem) in samples],
-    }
-    with meta_path.open("w") as fp:
-        json.dump(meta, fp)
+    _write_progress(progress_path, len(samples))
     print(f"[{tag}] wrote {cache_path}  ({cache_path.stat().st_size / 1024 ** 3:.2f} GB)")
     return cache_path
 

@@ -262,6 +262,58 @@ def _resolve_device(device: str) -> str:
     return device
 
 
+def _atomic_save(obj, path: str | Path) -> None:
+    """torch.save via tmp + rename so a crash mid-save can't corrupt the file."""
+    path = Path(path)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    th.save(obj, tmp)
+    tmp.replace(path)
+
+
+def _empty_history() -> dict:
+    return {
+        "train_loss": [], "train_bce": [], "train_cam_ce": [],
+        "val_loss": [], "val_bce": [], "val_cam_ce": [],
+        "val_binary_acc": [], "val_cam_bin_acc": [],
+    }
+
+
+def _try_resume_training(
+    out_weights: str,
+    model: nn.Module,
+    optim: th.optim.Optimizer,
+    device: str,
+    restart: bool,
+) -> tuple[int, dict]:
+    """Look for an existing checkpoint at `out_weights` and load model+optim
+    state if found. Returns (start_epoch, history). On `restart=True` or
+    missing checkpoint, returns (0, fresh_history).
+    """
+    out_path = Path(out_weights)
+    if restart or not out_path.exists():
+        return 0, _empty_history()
+    ckpt = th.load(out_path, map_location=device)
+    if "epoch" not in ckpt or "optimizer_state" not in ckpt:
+        # Legacy / final-only checkpoint — no resume possible.
+        print(f"[resume] {out_path} exists but has no epoch/optimizer_state — starting fresh")
+        return 0, _empty_history()
+    try:
+        # Heads come in two shapes: HeadOnlyAgent (top-level state_dict) and
+        # VLAAgent (only action_head saved). The caller passes the right model.
+        model.load_state_dict(ckpt["state_dict"])
+    except RuntimeError:
+        # VLAAgent path — checkpoint stored only the action_head weights.
+        model.action_head.load_state_dict(ckpt["state_dict"])
+    optim.load_state_dict(ckpt["optimizer_state"])
+    history = ckpt.get("training_metrics", _empty_history())
+    start_epoch = int(ckpt["epoch"]) + 1
+    val_suffix = (
+        f" (prev val_loss={history['val_loss'][-1]:.4f})" if history.get("val_loss") else ""
+    )
+    print(f"[resume] {out_path}: continuing from epoch {start_epoch}{val_suffix}")
+    return start_epoch, history
+
+
 def _print_device_info(device: str) -> None:
     print("\n" + "=" * 70)
     print("🖥️  Device Configuration")
@@ -288,11 +340,15 @@ def train_vla(
     past_action_k: int = DEFAULT_PAST_ACTION_K,
     chunk_size: int = 1,
     use_language: bool = True,
+    restart: bool = False,
 ):
     """Train the VLA action head and return (model, test_subset, history).
 
     `past_action_k` and `chunk_size` are the two temporal-context levers (see
     CLAUDE.md). `use_language=False` zeros the text prompt (ablation channel).
+    Checkpoints are written atomically after each epoch; if `out_weights`
+    already exists with epoch/optimizer state, training resumes from the next
+    epoch unless `restart=True`.
     """
     device = _resolve_device(device)
     _print_device_info(device)
@@ -350,11 +406,40 @@ def train_vla(
     ).to(device)
     optim = th.optim.Adam(model.action_head.parameters(), lr=lr)
 
-    history: dict[str, list[float]] = {
-        "train_loss": [], "train_bce": [], "train_cam_ce": [],
-        "val_loss": [], "val_bce": [], "val_cam_ce": [],
-        "val_binary_acc": [], "val_cam_bin_acc": [],
-    }
+    start_epoch, history = _try_resume_training(out_weights, model, optim, device, restart)
+
+    def _save_checkpoint(epoch_just_completed: int) -> None:
+        _atomic_save(
+            {
+                "llava_model": backbone,
+                "state_dict": model.action_head.state_dict(),
+                "optimizer_state": optim.state_dict(),
+                "epoch": epoch_just_completed,
+                "training_metrics": history,
+                "config": {
+                    "num_actions": NUM_ACTIONS,
+                    "num_binary": NUM_BINARY,
+                    "num_camera": NUM_CAMERA,
+                    "num_camera_bins": NUM_CAMERA_BINS,
+                    "num_output_logits": NUM_OUTPUT_LOGITS,
+                    "past_action_k": past_action_k,
+                    "past_action_dim": past_action_dim,
+                    "chunk_size": chunk_size,
+                    "use_language": use_language,
+                    "epochs": epochs,
+                    "batch_size": batch_size,
+                    "lr": lr,
+                    "val_split": val_split,
+                    "test_split": test_split,
+                    "camera_quantizer": {
+                        "camera_maxval": DEFAULT_CAMERA_QUANTIZER.camera_maxval,
+                        "camera_binsize": DEFAULT_CAMERA_QUANTIZER.camera_binsize,
+                        "mu": DEFAULT_CAMERA_QUANTIZER.mu,
+                    },
+                },
+            },
+            out_weights,
+        )
 
     def _flat_step_logits(logits_3d: th.Tensor) -> th.Tensor:
         """(B, N, NUM_OUTPUT_LOGITS) -> (B*N, NUM_OUTPUT_LOGITS) for metric slicing."""
@@ -363,7 +448,11 @@ def train_vla(
     def _flat_step_targets(targets_3d: th.Tensor) -> th.Tensor:
         return targets_3d.reshape(-1, targets_3d.size(-1))
 
-    for ep in range(epochs):
+    if start_epoch >= epochs:
+        print(f"Already trained for {start_epoch} epochs >= requested {epochs}; nothing to do.")
+        return model, test_set, history
+
+    for ep in range(start_epoch, epochs):
         model.train()
         train_total = train_bce = train_cam = 0.0
         for idx, (imgs, texts, acts, pasts) in enumerate(train_loader):
@@ -432,36 +521,8 @@ def train_vla(
             f"  cam_bin_acc={history['val_cam_bin_acc'][-1]:.4f}"
         )
         print("-" * 60)
+        _save_checkpoint(ep)
 
-    th.save(
-        {
-            "llava_model": backbone,
-            "state_dict": model.action_head.state_dict(),
-            "training_metrics": history,
-            "config": {
-                "num_actions": NUM_ACTIONS,
-                "num_binary": NUM_BINARY,
-                "num_camera": NUM_CAMERA,
-                "num_camera_bins": NUM_CAMERA_BINS,
-                "num_output_logits": NUM_OUTPUT_LOGITS,
-                "past_action_k": past_action_k,
-                "past_action_dim": past_action_dim,
-                "chunk_size": chunk_size,
-                "use_language": use_language,
-                "epochs": epochs,
-                "batch_size": batch_size,
-                "lr": lr,
-                "val_split": val_split,
-                "test_split": test_split,
-                "camera_quantizer": {
-                    "camera_maxval": DEFAULT_CAMERA_QUANTIZER.camera_maxval,
-                    "camera_binsize": DEFAULT_CAMERA_QUANTIZER.camera_binsize,
-                    "mu": DEFAULT_CAMERA_QUANTIZER.mu,
-                },
-            },
-        },
-        out_weights,
-    )
     print(f"\nTraining complete. Model saved to: {out_weights}")
     return model, test_set, history
 
@@ -489,12 +550,17 @@ def train_cached_head(
     past_action_k: int = DEFAULT_PAST_ACTION_K,
     chunk_size: int = 1,
     hidden_dim: int | None = None,
+    restart: bool = False,
 ):
     """Train an MLP head on precomputed backbone features.
 
     The cache must have been produced by `feature_cache.precompute(...)` with
     the matching task_filter and use_language settings. Past-action / chunk
     knobs are head-only and don't need cache regeneration.
+
+    Checkpoints are written atomically after each epoch; if `out_weights`
+    already exists with epoch/optimizer state, training resumes from the next
+    epoch unless `restart=True`.
 
     Returns (head, test_subset, history).
     """
@@ -554,13 +620,47 @@ def train_cached_head(
     ).to(device)
     optim = th.optim.Adam(model.parameters(), lr=lr)
 
-    history: dict[str, list[float]] = {
-        "train_loss": [], "train_bce": [], "train_cam_ce": [],
-        "val_loss": [], "val_bce": [], "val_cam_ce": [],
-        "val_binary_acc": [], "val_cam_bin_acc": [],
-    }
+    start_epoch, history = _try_resume_training(out_weights, model, optim, device, restart)
 
-    for ep in range(epochs):
+    def _save_checkpoint(epoch_just_completed: int) -> None:
+        _atomic_save(
+            {
+                "cache_tag": cache_tag,
+                "state_dict": model.state_dict(),
+                "optimizer_state": optim.state_dict(),
+                "epoch": epoch_just_completed,
+                "training_metrics": history,
+                "config": {
+                    "feature_dim": dataset.feature_dim(),
+                    "num_actions": NUM_ACTIONS,
+                    "num_binary": NUM_BINARY,
+                    "num_camera": NUM_CAMERA,
+                    "num_camera_bins": NUM_CAMERA_BINS,
+                    "num_output_logits": NUM_OUTPUT_LOGITS,
+                    "past_action_k": past_action_k,
+                    "past_action_dim": past_action_dim,
+                    "chunk_size": chunk_size,
+                    "hidden_dim": model.hidden_dim,
+                    "epochs": epochs,
+                    "batch_size": batch_size,
+                    "lr": lr,
+                    "val_split": val_split,
+                    "test_split": test_split,
+                    "camera_quantizer": {
+                        "camera_maxval": DEFAULT_CAMERA_QUANTIZER.camera_maxval,
+                        "camera_binsize": DEFAULT_CAMERA_QUANTIZER.camera_binsize,
+                        "mu": DEFAULT_CAMERA_QUANTIZER.mu,
+                    },
+                },
+            },
+            out_weights,
+        )
+
+    if start_epoch >= epochs:
+        print(f"Already trained for {start_epoch} epochs >= requested {epochs}; nothing to do.")
+        return model, test_set, history
+
+    for ep in range(start_epoch, epochs):
         model.train()
         train_total = train_bce = train_cam = 0.0
         for feats, acts, pasts in train_loader:
@@ -618,37 +718,8 @@ def train_cached_head(
             f"bin_acc={history['val_binary_acc'][-1]:.4f}  "
             f"cam_acc={history['val_cam_bin_acc'][-1]:.4f}"
         )
+        _save_checkpoint(ep)
 
-    th.save(
-        {
-            "cache_tag": cache_tag,
-            "state_dict": model.state_dict(),
-            "training_metrics": history,
-            "config": {
-                "feature_dim": dataset.feature_dim(),
-                "num_actions": NUM_ACTIONS,
-                "num_binary": NUM_BINARY,
-                "num_camera": NUM_CAMERA,
-                "num_camera_bins": NUM_CAMERA_BINS,
-                "num_output_logits": NUM_OUTPUT_LOGITS,
-                "past_action_k": past_action_k,
-                "past_action_dim": past_action_dim,
-                "chunk_size": chunk_size,
-                "hidden_dim": model.hidden_dim,
-                "epochs": epochs,
-                "batch_size": batch_size,
-                "lr": lr,
-                "val_split": val_split,
-                "test_split": test_split,
-                "camera_quantizer": {
-                    "camera_maxval": DEFAULT_CAMERA_QUANTIZER.camera_maxval,
-                    "camera_binsize": DEFAULT_CAMERA_QUANTIZER.camera_binsize,
-                    "mu": DEFAULT_CAMERA_QUANTIZER.mu,
-                },
-            },
-        },
-        out_weights,
-    )
     print(f"Cached-head training complete. Saved to: {out_weights}")
     return model, test_set, history
 
@@ -875,6 +946,11 @@ if __name__ == "__main__":
         help="Zero the text prompt — for the language-pathway ablation cell",
     )
     p.add_argument(
+        "--restart",
+        action="store_true",
+        help="Ignore any existing checkpoint at --out-weights and start from epoch 0",
+    )
+    p.add_argument(
         "--evaluate-after",
         action="store_true",
         help="Run evaluate() on the held-out test split after training",
@@ -895,6 +971,7 @@ if __name__ == "__main__":
         past_action_k=a.past_action_k,
         chunk_size=a.chunk_size,
         use_language=not a.no_language,
+        restart=a.restart,
     )
     if a.evaluate_after and len(test_set) > 0:
         evaluate(

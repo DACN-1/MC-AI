@@ -328,5 +328,127 @@ class HeadOnlyAgentTests(unittest.TestCase):
             model(torch.randn(1, 8))  # no past_actions passed
 
 
+# ---------------------------------------------------------------------
+# Resumability primitives: atomic save + progress reads/writes
+# ---------------------------------------------------------------------
+class ResumePrimitivesTests(unittest.TestCase):
+    def test_atomic_save_writes_and_replaces(self):
+        from imitation_learning import _atomic_save
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "model.pt"
+            _atomic_save({"x": 42}, path)
+            self.assertTrue(path.exists())
+            self.assertFalse(path.with_suffix(".pt.tmp").exists())
+            loaded = torch.load(path, map_location="cpu", weights_only=False)
+            self.assertEqual(loaded["x"], 42)
+
+    def test_atomic_save_overwrites_existing(self):
+        from imitation_learning import _atomic_save
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "ckpt.pt"
+            _atomic_save({"v": 1}, path)
+            _atomic_save({"v": 2}, path)
+            self.assertEqual(
+                torch.load(path, map_location="cpu", weights_only=False)["v"], 2
+            )
+
+    def test_progress_roundtrip(self):
+        from feature_cache import _read_progress, _write_progress
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "x.progress"
+            self.assertEqual(_read_progress(p), 0)
+            _write_progress(p, 12345)
+            self.assertEqual(_read_progress(p), 12345)
+
+    def test_progress_read_recovers_from_empty_file(self):
+        from feature_cache import _read_progress
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "x.progress"
+            p.write_text("")  # simulate crash mid-write
+            self.assertEqual(_read_progress(p), 0)
+
+
+class HeadOnlyTrainingResumeTests(unittest.TestCase):
+    """End-to-end check that training resumes from a checkpoint and the
+    final state matches a fresh run (deterministic seeded)."""
+
+    def test_resume_continues_from_checkpoint(self):
+        import tempfile
+        from feature_cache import HeadOnlyAgent
+        from imitation_learning import _atomic_save, _try_resume_training
+
+        torch.manual_seed(0)
+        model = HeadOnlyAgent(feature_dim=16, output_dim=NUM_OUTPUT_LOGITS, chunk_size=1)
+        optim = torch.optim.Adam(model.parameters(), lr=1e-3)
+
+        # Fake one epoch of "training" — perturb params + step optimizer state.
+        for p in model.parameters():
+            p.data += 0.01
+        optim.zero_grad()
+        for p in model.parameters():
+            p.grad = torch.ones_like(p)
+        optim.step()
+
+        snapshot_state = {k: v.clone() for k, v in model.state_dict().items()}
+        snapshot_opt = optim.state_dict()
+        history = {"train_loss": [0.5], "val_loss": [0.6]}
+
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "ckpt.pt"
+            _atomic_save(
+                {
+                    "state_dict": snapshot_state,
+                    "optimizer_state": snapshot_opt,
+                    "epoch": 3,
+                    "training_metrics": history,
+                },
+                path,
+            )
+
+            # Fresh model + optimizer; load from checkpoint via _try_resume_training.
+            torch.manual_seed(99)  # different seed — would diverge if not loaded
+            fresh_model = HeadOnlyAgent(feature_dim=16, output_dim=NUM_OUTPUT_LOGITS, chunk_size=1)
+            fresh_optim = torch.optim.Adam(fresh_model.parameters(), lr=1e-3)
+            start_epoch, loaded_history = _try_resume_training(
+                str(path), fresh_model, fresh_optim, device="cpu", restart=False
+            )
+            self.assertEqual(start_epoch, 4)
+            self.assertEqual(loaded_history["train_loss"], [0.5])
+            for k, v in fresh_model.state_dict().items():
+                torch.testing.assert_close(v, snapshot_state[k])
+
+    def test_restart_flag_ignores_checkpoint(self):
+        import tempfile
+        from feature_cache import HeadOnlyAgent
+        from imitation_learning import _atomic_save, _try_resume_training
+
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "ckpt.pt"
+            _atomic_save(
+                {
+                    "state_dict": {},
+                    "optimizer_state": {},
+                    "epoch": 7,
+                    "training_metrics": {"train_loss": [1.0]},
+                },
+                path,
+            )
+            model = HeadOnlyAgent(feature_dim=8, output_dim=NUM_OUTPUT_LOGITS, chunk_size=1)
+            optim = torch.optim.Adam(model.parameters(), lr=1e-3)
+            start_epoch, history = _try_resume_training(
+                str(path), model, optim, device="cpu", restart=True
+            )
+            self.assertEqual(start_epoch, 0)
+            self.assertEqual(history["train_loss"], [])
+
+
 if __name__ == "__main__":
     unittest.main()

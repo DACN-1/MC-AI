@@ -283,6 +283,26 @@ Pinned in `requirements.txt` for the JURECA cluster (Python 3.10, torch 2.1.0
 rollout path; everything else only needs the ML stack + `decord` for frame
 decoding.
 
+## Resumability
+
+Both cache builds and head training survive SLURM job kills / reboots:
+
+- **`feature_cache.precompute`** writes a `<tag>.progress` sidecar atomically
+  every 100 batches (default `progress_interval=100`). On restart it
+  validates the existing `<tag>.json` metadata against the current request —
+  same sample count, feature dim, backbone, language flag — and resumes the
+  memmap in `r+` mode from the recorded sample. Mismatches trigger a
+  rebuild from scratch. Worst-case loss from a crash: ~100 × `batch_size`
+  encoded samples.
+- **`train_vla` / `train_cached_head`** write a full checkpoint after every
+  epoch via `_atomic_save` (tmp + rename, never partial). The checkpoint
+  carries `state_dict` + `optimizer_state` + `epoch` + `training_metrics` +
+  `config`. On restart the trainer auto-resumes from epoch+1; pass
+  `--restart` to ignore the existing checkpoint and start over.
+
+Both layers handle the typical SLURM failure modes (OOM kill, time limit,
+node reboot) without manual intervention.
+
 ## Compute budget
 
 For the 2×2 ablation (LLaVA/CLIP × language on/off) on both tasks with the

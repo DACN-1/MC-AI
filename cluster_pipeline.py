@@ -142,6 +142,11 @@ def main():
         action="store_true",
         help="Skip caching; train backbone+head end-to-end (legacy path).",
     )
+    parser.add_argument(
+        "--restart",
+        action="store_true",
+        help="Ignore any existing checkpoint at <output-dir>/model.pt and retrain from epoch 0",
+    )
     parser.add_argument("--skip-train", action="store_true", help="Load existing model and run eval only")
     args = parser.parse_args()
 
@@ -178,6 +183,7 @@ def main():
                 past_action_k=args.past_action_k,
                 chunk_size=args.chunk_size,
                 use_language=use_language,
+                restart=args.restart,
             )
         else:
             print(f"Loading existing model from {model_path}")
@@ -247,6 +253,7 @@ def main():
                 num_workers=args.num_workers,
                 past_action_k=args.past_action_k,
                 chunk_size=args.chunk_size,
+                restart=args.restart,
             )
         else:
             from feature_cache import CachedFeatureDataset, HeadOnlyAgent
