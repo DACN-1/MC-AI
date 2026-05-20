@@ -67,7 +67,6 @@ r1v-a/
 ├── feature_cache.py         Precompute LLaVA/CLIP embeddings + CachedFeatureDataset + HeadOnlyAgent
 ├── imitation_learning.py    TrajectoryDataset, vla_loss, train_vla, train_cached_head, evaluate, CLI
 ├── action_mapping.py        Logits -> MineRL action dict (argmax + undiscretize)
-├── chunk_frames.py          (deprecated) MP4/PNG -> HDF5 chunked frames
 ├── consolidate_metadata.py  actions/*.jsonl + infos/*.json -> all_actions.json
 ├── cluster_pipeline.py      Train -> evaluate (calls into above)
 ├── run_rollout.py           Run trained agent (or random) in MineRL

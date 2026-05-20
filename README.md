@@ -27,31 +27,37 @@ docker compose run --remove-orphans minerl run_rollout.py --episodes 1
 ## Pipeline
 
 ```
-MP4 + actions  --chunk_frames-->  *.h5  --imitation_learning-->  model.pt
+MP4 + actions  --feature_cache-->  *.npy  --imitation_learning-->  model.pt
                                                                     │
                                                   run_rollout / cluster_pipeline
 ```
 
+Frames are decoded on demand from the MP4 files via `decord`; the frozen
+backbone's pooled features are cached once per (backbone × task × language)
+cell so head training runs at MLP speed.
+
 Locally:
 
 ```bash
-# 1. Convert MP4 -> HDF5 chunks
-python chunk_frames.py --data-dir ./trajectories --skip-existing
+# 1. Precompute backbone features (one-time per ablation cell)
+python feature_cache.py --data-dir ./trajectories --cache-dir ./caches \
+    --backbone llava --task-filter chop_a_tree --use-language
 
-# 2. Train the action head
-python imitation_learning.py \
-    --data-dir ./trajectories \
-    --out-weights ./models/vla.pt \
-    --epochs 10 --batch-size 16 --num-workers 2 --evaluate-after
+# 2. Train the head + evaluate
+python cluster_pipeline.py \
+    --data-dir ./trajectories --cache-dir ./caches --output-dir ./output \
+    --backbone llava --task-filter chop_a_tree \
+    --past-action-k 8 --chunk-size 8 \
+    --epochs 10 --batch-size 256
 
-# 3. Roll out the trained agent
+# 3. Roll out the trained agent (in Docker for MineRL)
 python run_rollout.py \
-    --model-path ./models/vla.pt \
+    --model-path ./output/model.pt \
     --env MineRLBasaltFindCave-v0 \
     --episodes 5 --device cuda --record-video
 ```
 
-End-to-end on a SLURM cluster: `sbatch slurm_train.sh`.
+End-to-end on a SLURM cluster: `BACKBONE=llava TASK_FILTER=chop_a_tree USE_LANGUAGE=1 sbatch slurm_train.sh`.
 
 ## Action Space
 
@@ -82,11 +88,11 @@ constants.py             canonical action keys + action_to_tensor() + size const
 vpt_camera.py            CameraQuantizer (mu-law) — vendored from OpenAI VPT
 VLAAgent.py              frozen LLaVA backbone + trainable MLP head
 frozen_vision_baseline.py  CLIP-only baseline with the same forward signature
-imitation_learning.py    TrajectoryDataset, vla_loss, train_vla, evaluate, CLI
+feature_cache.py         precompute backbone embeddings + CachedFeatureDataset + HeadOnlyAgent
+imitation_learning.py    TrajectoryDataset, vla_loss, train_vla, train_cached_head, evaluate, CLI
 action_mapping.py        logits -> MineRL action dict
-chunk_frames.py          MP4/PNG -> HDF5 chunked frames
 consolidate_metadata.py  collapse per-video JSONL files into all_actions.json
-cluster_pipeline.py      convert -> train -> evaluate orchestration
+cluster_pipeline.py      cache -> train -> evaluate orchestration
 run_rollout.py           run trained or random agent in MineRL
 eval_logger.py           per-episode / per-run metrics
 slurm_train.sh           SLURM job script

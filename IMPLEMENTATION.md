@@ -140,9 +140,9 @@ VLAAgent.py              frozen LLaVA + trainable MLP head
 frozen_vision_baseline.py  CLIP-only baseline (same forward signature)
 imitation_learning.py    TrajectoryDataset, vla_loss, train_vla, evaluate, CLI
 action_mapping.py        43 logits → MineRL action dict
-chunk_frames.py          MP4/PNG → HDF5 chunked frames (gzip, buffered writes)
+feature_cache.py         precompute backbone features → CachedFeatureDataset + HeadOnlyAgent
 consolidate_metadata.py  per-video JSONLs → all_actions.json / all_infos.json
-cluster_pipeline.py      convert → train → evaluate orchestration
+cluster_pipeline.py      cache → train → evaluate orchestration
 run_rollout.py           run trained or random agent in MineRL
 eval_logger.py           per-episode and per-run rollout metrics
 slurm_train.sh           SLURM job script wrapping cluster_pipeline.py
@@ -193,14 +193,15 @@ tests/test_action_conversion.py  20 unit tests
 
 The biggest module. Owns:
 
-- **`TrajectoryDataset`** — reads frames from HDF5 and actions from either
-  consolidated JSON or legacy per-video files.
-  - `_h5(path)` opens the HDF5 lazily, **per worker**, and caches the handle.
-    Avoids the open-and-close-per-`__getitem__` overhead the original code
-    had. Each DataLoader worker holds its own dict because h5py file handles
-    aren't fork-safe.
-  - `__getitem__` returns `(PIL.Image, str, th.Tensor)` so we can feed images
-    directly to the LLaVA processor without a re-conversion.
+- **`TrajectoryDataset`** — reads frames directly from MP4 files via
+  `decord.VideoReader` and actions from either consolidated JSON or legacy
+  per-video files.
+  - `_decoder(path)` opens the `VideoReader` lazily, **per worker**, and caches
+    it in a bounded LRU (default 64 files per worker). Avoids reopening the
+    container on every `__getitem__`. Each DataLoader worker holds its own
+    cache because decoder handles aren't fork-safe.
+  - `__getitem__` returns `(PIL.Image, str, target_chunk, past_actions)` so we
+    can feed images directly to the LLaVA processor without a re-conversion.
 
 - **`vla_loss(logits, targets)`** — composite loss:
   ```
@@ -243,27 +244,38 @@ The biggest module. Owns:
   rollout time — `run_rollout.py` captures `env.action_space.no_op()` once per
   episode and merges over it each step.
 
-### 3.6 `chunk_frames.py`
+### 3.6 `feature_cache.py`
 
-Converts MP4 / PNG sequences to HDF5 with a chunked, gzip-compressed `frames`
-dataset of shape `(N, H, W, 3)` uint8.
+Precomputes pooled features from the frozen backbone so head training runs at
+MLP speed. The on-disk format is intentionally minimal:
 
-- **Buffered chunk writes**: original code wrote frames one at a time, which
-  forces h5py to re-encode the chunk on every write (chunked + compressed
-  datasets aren't append-friendly). New code buffers a full `frames_per_chunk`
-  worth of frames in a numpy array and writes the whole chunk in one shot.
-- **`maxshape=(None, H, W, 3)`** on the dataset so we can `dset.resize(...)`
-  if `cap.read()` fails before reaching the reported `total_frames`. Without
-  resize the trailing rows would silently stay all-zero.
-- Compression is `gzip` (level 4). The previous `lz4` option silently fell
-  back to gzip while reporting `lz4` in the metadata; that's been removed.
+- `<cache_dir>/<tag>.npy` — `(N_samples, feature_dim)` float16 memmap.
+- `<cache_dir>/<tag>.json` — metadata (tag, backbone, use_language,
+  task_filter, n_samples, feature_dim, samples list with stem + frame_idx).
+- `<cache_dir>/<tag>.progress` — atomic-rename progress cursor, written every
+  `progress_interval` batches; a crash loses at most that much work.
+
+`precompute(...)` is **resumable**: when the cache files exist and metadata
+matches the current request, encoding picks up from the recorded sample;
+mismatches trigger a clean rebuild.
+
+`CachedFeatureDataset` rebuilds (target, past-action) features from
+`all_actions.json` at training time, so the same cache serves any
+`chunk_size` / `past_action_k` combo without rebuilding.
+
+`HeadOnlyAgent` mirrors `VLAAgent.action_head` exactly, so a head trained on
+cached features is structurally interchangeable with one trained end-to-end.
 
 ### 3.7 `cluster_pipeline.py`
 
-Three-step orchestration: `convert_videos` (parallel MP4 → H5 with
-multiprocessing) → `train_vla` → `evaluate`. The training and evaluation
-logic is *not* duplicated here — it's imported from `imitation_learning`. Only
-the parallel video-conversion lives in this file.
+Two-mode orchestration:
+- **Default (cached) path**: ensure cache exists via
+  `feature_cache.precompute`, then `train_cached_head` → `evaluate_cached`.
+- **`--end-to-end`**: legacy `train_vla` → `evaluate` path that runs the
+  backbone every batch (LLaVA only).
+
+Training and evaluation logic are *not* duplicated here — they're imported
+from `imitation_learning`.
 
 ### 3.8 `run_rollout.py`
 
@@ -294,45 +306,49 @@ doesn't pull in transformers.
 
 ```
 trajectories/                       (input)
-├── trajectory_task_*/
-│   ├── all_actions.json            consolidated demos
-│   ├── all_infos.json              optional metadata (text_prompt, ...)
-│   └── videos/*.mp4                source recordings (deleted after convert)
-└── (frames_chunked/ created by chunk_frames.py)
+└── trajectory_task_*/
+    ├── all_actions.json            consolidated demos
+    ├── all_infos.json              optional metadata (text_prompt, ...)
+    └── videos/*.mp4                source recordings (read directly via decord)
 
            │
-           │ chunk_frames.py / cluster_pipeline.convert_videos
+           │ feature_cache.precompute  (one-time per ablation cell)
            ▼
 
-trajectories/frames_chunked/
-└── video_<stem>.h5                 (N, H, W, 3) uint8, gzip-chunked
+caches/
+├── <tag>.npy                       (N_samples, feature_dim) float16 memmap
+├── <tag>.json                      metadata (stems, frame indices, sizes)
+└── <tag>.progress                  atomic-resume cursor
 
            │
-           │ TrajectoryDataset.__init__
+           │ CachedFeatureDataset.__init__
+           │   └── rebuilds (target, past-action) features from all_actions.json
            ▼
 
-samples: list of (h5_path, frame_idx, prompt, action_dict)
+samples: list of (stem, frame_idx) referencing cached rows
 
            │
-           │ DataLoader(workers=N, collate=_collate)
-           │   └── per-worker H5 cache (lazy)
-           │   └── action_to_tensor turns each dict into (23,) float32
+           │ DataLoader(workers=N, collate=_cached_collate)
            ▼
 
-batch: (PIL.Image list, prompt list, (B, 23) float32)
+batch: ((B, feature_dim) fp32, (B, chunk_size, 23) fp32, (B, K*43) fp32)
 
            │
-           │ VLAAgent.forward
+           │ HeadOnlyAgent.forward
            ▼
 
-logits: (B, 43) fp32
+logits: (B, chunk_size, 43) fp32
 
            │
-           │ vla_loss
+           │ vla_loss   (chunk axis flattened — every step weighted equally)
            ▼
 
 (loss, bce_value, cam_ce_value) → backward → Adam.step()
 ```
+
+The `--end-to-end` legacy path swaps the cache step for `TrajectoryDataset` +
+`VLAAgent.forward` — frames are decoded on demand via decord and the backbone
+runs every batch. Same loss, same checkpoint format.
 
 Targets layout:
 
@@ -430,15 +446,17 @@ checkpoint isn't a dict with `"state_dict"`.
 
 ## 8. Performance considerations
 
-- **HDF5 file handles are cached per worker.** The previous implementation
-  opened and closed the H5 file on every `__getitem__`; with `num_workers=0`
-  that's a serial bottleneck. The cache is keyed by path because a dataset
-  may span multiple H5 files (one per source video).
-- **`persistent_workers=True`** keeps that cache alive across epochs.
-- **Frames are buffered into chunk-sized numpy arrays before being written
-  to HDF5.** Random per-frame writes to a chunked, compressed dataset force
-  h5py to decode-and-re-encode the chunk on each write — buffered writes
-  give you 1 encode per chunk instead of 100.
+- **Decord `VideoReader`s are cached per worker, LRU-bounded.** Reopening the
+  container on every `__getitem__` is too expensive; each worker keeps up to
+  `decoder_cache_size` (default 64) readers alive. Keep
+  `decoder_cache_size * num_workers` under your fd limit.
+- **`persistent_workers=True`** keeps those caches alive across epochs.
+- **Backbone features are precomputed once and stored as a float16 memmap.**
+  The frozen LLaVA / CLIP pass is the dominant cost (~95 % of end-to-end
+  training time); caching collapses head training to MLP speed (~50 µs/sample).
+  The cache build is resumable via an atomically-written `.progress` cursor,
+  so SLURM time-limits / preemption never cost more than `progress_interval`
+  batches of work.
 - **Action head stays in fp32**, even though LLaVA runs fp16. Optimizer
   updates on fp16 weights with Adam are fragile; the cost of casting
   pooled features to fp32 once per forward pass is negligible compared to

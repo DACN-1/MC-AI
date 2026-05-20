@@ -185,8 +185,6 @@ run_rollout.py               MineRL runner with past-action buffer + chunk-first
 cluster_pipeline.py          Default: cached path. --end-to-end opts into legacy.
                              --restart forces fresh training.
 slurm_train.sh               BACKBONE/TASK_FILTER/USE_LANGUAGE env-var driven; auto-tags output
-chunk_frames.py              (deprecated) MP4 -> HDF5 — keep until cluster throughput
-                             validated, then deletable
 tests/                       Action encoding, loss shapes, HeadOnlyAgent contract,
                              atomic save, progress roundtrip, resume against snapshot
 ```
