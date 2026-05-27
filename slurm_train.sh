@@ -68,17 +68,30 @@ export TRANSFORMERS_CACHE="$HF_HOME/transformers"
 mkdir -p "$DATA_DIR" "$CACHE_DIR" "$OUTPUT_DIR" "$HF_HOME"
 
 # ---------- stage trajectory data on local NVMe -----------------------------
+# The tarballs wrap their contents in an extra AAA_trajectory/ directory and
+# ship per-video action/info JSONLs without the consolidated all_actions.json
+# that feature_cache.enumerate_samples requires. So:
+#   1. --strip-components=1 drops the wrapper.
+#   2. consolidate_metadata.py walks the extracted dir and writes
+#      all_actions.json + all_infos.json once.
+# Both steps are idempotent so reruns on the same node are no-ops.
 TRAJ_SUBDIR="$DATA_DIR/trajectory_task_${TASK_FILTER}_length_3000"
-if [ ! -d "$TRAJ_SUBDIR" ]; then
+if [ ! -f "$TRAJ_SUBDIR/all_actions.json" ]; then
     TARBALL=$(ls "$DATA_TARBALL_DIR"/trajectory_task_${TASK_FILTER}_*.tar.gz 2>/dev/null | head -1 || true)
     if [ -z "$TARBALL" ]; then
         echo "ERROR: no tarball matching trajectory_task_${TASK_FILTER}_*.tar.gz under $DATA_TARBALL_DIR" >&2
         exit 1
     fi
-    echo "Extracting $TARBALL -> $DATA_DIR (one-time per node)"
-    tar -xzf "$TARBALL" -C "$DATA_DIR"
+    if [ ! -d "$TRAJ_SUBDIR" ]; then
+        echo "Extracting $TARBALL -> $DATA_DIR (strip AAA_trajectory/ wrapper)"
+        tar -xzf "$TARBALL" -C "$DATA_DIR" --strip-components=1
+    else
+        echo "Already extracted: $TRAJ_SUBDIR (missing consolidated JSON only)"
+    fi
+    echo "Consolidating per-video JSONLs -> all_actions.json + all_infos.json"
+    python consolidate_metadata.py --data-dir "$DATA_DIR" --delete-originals
 else
-    echo "Trajectory dir already staged: $TRAJ_SUBDIR"
+    echo "Trajectory + consolidated JSON already staged: $TRAJ_SUBDIR"
 fi
 
 echo "Cell: backbone=$BACKBONE  task=$TASK_FILTER  use_language=$USE_LANGUAGE"
