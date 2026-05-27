@@ -531,8 +531,8 @@ def train_vla(
 # Cached-feature training (used after `feature_cache.precompute`)
 # ---------------------------------------------------------------------
 def _cached_collate(batch):
-    feats, targets, pasts, task_ids = zip(*batch)
-    return th.stack(feats), th.stack(targets), th.stack(pasts), th.stack(task_ids)
+    feats, targets, pasts = zip(*batch)
+    return th.stack(feats), th.stack(targets), th.stack(pasts)
 
 
 def train_cached_head(
@@ -551,7 +551,6 @@ def train_cached_head(
     chunk_size: int = 1,
     hidden_dim: int | None = None,
     restart: bool = False,
-    use_task_id: bool = False,
 ):
     """Train an MLP head on precomputed backbone features.
 
@@ -576,15 +575,11 @@ def train_cached_head(
         data_root=data_root,
         past_action_k=past_action_k,
         chunk_size=chunk_size,
-        use_task_id=use_task_id,
     )
     print(
         f"Cached dataset: {len(dataset):,} samples  "
-        f"(tag={cache_tag}  past_action_k={past_action_k}  chunk_size={chunk_size}  "
-        f"task_id_dim={dataset.task_id_dim()})"
+        f"(tag={cache_tag}  past_action_k={past_action_k}  chunk_size={chunk_size})"
     )
-    if use_task_id and dataset.task_names:
-        print(f"  task IDs: {dict(enumerate(dataset.task_names))}")
 
     test_size = int(len(dataset) * test_split)
     val_size = int(len(dataset) * val_split)
@@ -616,12 +611,10 @@ def train_cached_head(
     )
 
     past_action_dim = past_action_k * PAST_ACTION_DIM
-    task_id_dim = dataset.task_id_dim()
     model = HeadOnlyAgent(
         feature_dim=dataset.feature_dim(),
         output_dim=NUM_OUTPUT_LOGITS,
         past_action_dim=past_action_dim,
-        task_id_dim=task_id_dim,
         chunk_size=chunk_size,
         hidden_dim=hidden_dim,
     ).to(device)
@@ -646,8 +639,6 @@ def train_cached_head(
                     "num_output_logits": NUM_OUTPUT_LOGITS,
                     "past_action_k": past_action_k,
                     "past_action_dim": past_action_dim,
-                    "task_id_dim": task_id_dim,
-                    "task_names": dataset.task_names,
                     "chunk_size": chunk_size,
                     "hidden_dim": model.hidden_dim,
                     "epochs": epochs,
@@ -672,13 +663,12 @@ def train_cached_head(
     for ep in range(start_epoch, epochs):
         model.train()
         train_total = train_bce = train_cam = 0.0
-        for feats, acts, pasts, tids in train_loader:
+        for feats, acts, pasts in train_loader:
             feats = feats.to(device)
             acts = acts.to(device)
             pasts = pasts.to(device)
-            tids = tids.to(device)
             optim.zero_grad()
-            logits = model(feats, pasts, tids)
+            logits = model(feats, pasts)
             loss, bce_v, cam_v = vla_loss(logits, acts)
             loss.backward()
             optim.step()
@@ -695,12 +685,11 @@ def train_cached_head(
         binary_correct = binary_seen = 0
         cam_correct = cam_seen = 0
         with th.no_grad():
-            for feats, acts, pasts, tids in val_loader:
+            for feats, acts, pasts in val_loader:
                 feats = feats.to(device)
                 acts = acts.to(device)
                 pasts = pasts.to(device)
-                tids = tids.to(device)
-                logits = model(feats, pasts, tids)
+                logits = model(feats, pasts)
                 loss, bce_v, cam_v = vla_loss(logits, acts)
                 val_total += loss.item()
                 val_bce += bce_v
@@ -764,12 +753,11 @@ def evaluate_cached(
     cam_y_target_bins: list[th.Tensor] = []
 
     with th.no_grad():
-        for feats, acts, pasts, tids in loader:
+        for feats, acts, pasts in loader:
             feats = feats.to(device)
             acts = acts.to(device)
             pasts = pasts.to(device)
-            tids = tids.to(device)
-            logits = model(feats, pasts, tids)
+            logits = model(feats, pasts)
             logits_flat = logits.reshape(-1, logits.size(-1))
             acts_flat = acts.reshape(-1, acts.size(-1))
             binary_preds.append((th.sigmoid(logits_flat[:, :NUM_BINARY]) > 0.5).float().cpu())

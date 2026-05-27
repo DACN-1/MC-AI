@@ -40,13 +40,11 @@ mkdir -p logs
 # ---------- ablation-cell selectors (one job per cell) ----------------------
 #   BACKBONE: llava | clip          (frozen backbone)
 #   USE_LANGUAGE: 1 | 0             (0 -> text prompt zeroed in the encoder)
-#   USE_TASK_ID: 1 | 0              (1 -> one-hot task ID concatenated to head input)
 #   TASK_FILTER (optional): substring of trajectory_task_<task>_*. If unset,
 #       the cache is built on the union of every trajectory_task_* dir found
 #       under DATA_DIR (the standard combined-dataset ablation cell).
 BACKBONE="${BACKBONE:-llava}"
 USE_LANGUAGE="${USE_LANGUAGE:-1}"
-USE_TASK_ID="${USE_TASK_ID:-0}"
 TASK_FILTER="${TASK_FILTER:-}"        # empty = combined cache across both tasks
 
 EPOCHS="${EPOCHS:-10}"
@@ -65,10 +63,6 @@ CHUNK_SIZE="${CHUNK_SIZE:-8}"
 
 LANG_TAG=$([ "$USE_LANGUAGE" = "1" ] && echo lang || echo nolang)
 TASK_TAG=${TASK_FILTER:-combined}
-TASKID_SUFFIX=""
-if [ "$USE_TASK_ID" = "1" ]; then
-    TASKID_SUFFIX="_taskid"
-fi
 
 # ---------- storage layout --------------------------------------------------
 # /var/tmp1 is the local NVMe on Abaki nodes (1 TB on 1N, 2 TB on 2N).
@@ -80,7 +74,7 @@ mkdir -p "$NODE_SCRATCH"
 DATA_TARBALL_DIR="$REPO_ROOT/trajectories"            # persistent tarballs
 DATA_DIR="$NODE_SCRATCH/trajectories"                 # extracted, per node
 CACHE_DIR="$NODE_SCRATCH/caches"                      # survives across jobs
-OUTPUT_DIR="$REPO_ROOT/output/${BACKBONE}_${TASK_TAG}_${LANG_TAG}${TASKID_SUFFIX}"
+OUTPUT_DIR="$REPO_ROOT/output/${BACKBONE}_${TASK_TAG}_${LANG_TAG}"
 
 export HF_HOME="$NODE_SCRATCH/hf_cache"
 export TRANSFORMERS_CACHE="$HF_HOME/transformers"
@@ -139,7 +133,7 @@ if [ "$NEED_CONSOLIDATE" = "1" ]; then
     python consolidate_metadata.py --data-dir "$DATA_DIR" --delete-originals
 fi
 
-echo "Cell: backbone=$BACKBONE  task_filter=${TASK_FILTER:-<combined>}  use_language=$USE_LANGUAGE  use_task_id=$USE_TASK_ID"
+echo "Cell: backbone=$BACKBONE  task_filter=${TASK_FILTER:-<combined>}  use_language=$USE_LANGUAGE"
 echo "Past-action K=$PAST_ACTION_K  chunk=$CHUNK_SIZE  epochs=$EPOCHS  batch=$BATCH_SIZE  lr=$LR"
 echo "Data=$DATA_DIR  cache=$CACHE_DIR  output=$OUTPUT_DIR  HF_HOME=$HF_HOME"
 
@@ -149,9 +143,6 @@ if [ "$USE_LANGUAGE" != "1" ]; then
 fi
 if [ -n "$TASK_FILTER" ]; then
     EXTRA_FLAGS+=("--task-filter" "$TASK_FILTER")
-fi
-if [ "$USE_TASK_ID" = "1" ]; then
-    EXTRA_FLAGS+=("--task-id")
 fi
 
 # ---------- run -------------------------------------------------------------
