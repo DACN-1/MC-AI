@@ -47,14 +47,15 @@ from imitation_learning import (
 )
 
 
-def _cache_tag(backbone: str, task_filter: str, use_language: bool) -> str:
-    return f"{backbone}_{task_filter}_{'lang' if use_language else 'nolang'}"
+def _cache_tag(backbone: str, task_filter: str | None, use_language: bool) -> str:
+    task_part = task_filter if task_filter else "combined"
+    return f"{backbone}_{task_part}_{'lang' if use_language else 'nolang'}"
 
 
 def _ensure_cache(
     cache_dir: Path,
     backbone: str,
-    task_filter: str,
+    task_filter: str | None,
     use_language: bool,
     data_dir: Path,
     llava_id: str,
@@ -122,8 +123,15 @@ def main():
     parser.add_argument("--cache-dir", type=Path, default=Path("./caches"))
     parser.add_argument(
         "--task-filter",
-        required=True,
-        help="Substring matched against trajectory_task_* dir name (e.g. 'chop_a_tree')",
+        default=None,
+        help="Substring matched against trajectory_task_* dir name (e.g. 'chop_a_tree'). "
+             "Omit to build a combined cache across every task dir (recommended default).",
+    )
+    parser.add_argument(
+        "--task-id",
+        action="store_true",
+        help="Feed a one-hot task ID into the head input. Useful for the "
+             "task-aware multi-task baseline that isolates language from task disambiguation.",
     )
     parser.add_argument(
         "--backbone",
@@ -282,6 +290,7 @@ def main():
                 past_action_k=args.past_action_k,
                 chunk_size=args.chunk_size,
                 restart=args.restart,
+                use_task_id=args.task_id,
             )
         else:
             from feature_cache import CachedFeatureDataset, HeadOnlyAgent
@@ -291,17 +300,20 @@ def main():
             cfg = ckpt.get("config", {})
             past_action_k = cfg.get("past_action_k", 0)
             chunk_size = cfg.get("chunk_size", 1)
+            use_task_id = cfg.get("task_id_dim", 0) > 0
             dataset = CachedFeatureDataset(
                 cache_dir=str(args.cache_dir),
                 tag=tag,
                 data_root=str(args.data_dir),
                 past_action_k=past_action_k,
                 chunk_size=chunk_size,
+                use_task_id=use_task_id,
             )
             model = HeadOnlyAgent(
                 feature_dim=cfg["feature_dim"],
                 output_dim=NUM_OUTPUT_LOGITS,
                 past_action_dim=cfg.get("past_action_dim", 0),
+                task_id_dim=cfg.get("task_id_dim", 0),
                 chunk_size=chunk_size,
                 hidden_dim=cfg.get("hidden_dim"),
             ).to(args.device)

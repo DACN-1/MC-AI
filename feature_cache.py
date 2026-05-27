@@ -301,12 +301,29 @@ def load_cache(cache_dir: str | Path, tag: str) -> tuple[np.ndarray, dict]:
 # ---------------------------------------------------------------------
 # Head-only training pieces
 # ---------------------------------------------------------------------
+def _task_from_stem(stem: str) -> str:
+    """Derive task name from a contractor stem.
+
+    Stems look like `chop_a_tree_freq_25_cond_scale_6.0_length_3000_seed_1`,
+    so the task name is the substring before `_freq_`. Falls back to the
+    full stem if the marker is absent.
+    """
+    if "_freq_" in stem:
+        return stem.split("_freq_")[0]
+    return stem
+
+
 class CachedFeatureDataset(th.utils.data.Dataset):
-    """Dataset over (cached_feature, target_chunk, past_actions) tuples.
+    """Dataset over (cached_feature, target_chunk, past_actions, task_id) tuples.
 
     Reads pooled features from a memmap produced by `precompute`, and
-    reconstructs targets / past-actions from the original all_actions.json
-    files (so the same cache serves any chunk_size / past_action_k combination).
+    reconstructs targets / past-actions / task IDs from the original
+    all_actions.json files (so the same cache serves any chunk_size /
+    past_action_k / task_id combination).
+
+    `use_task_id=True` emits a one-hot task vector per sample (auto-discovered
+    from stem prefixes; ordered alphabetically). Used by the "no-language but
+    task-aware" ablation cell — see CLAUDE.md.
     """
 
     def __init__(
@@ -316,16 +333,13 @@ class CachedFeatureDataset(th.utils.data.Dataset):
         data_root: str | Path,
         past_action_k: int = 0,
         chunk_size: int = 1,
+        use_task_id: bool = False,
     ):
         self.past_action_k = past_action_k
         self.chunk_size = chunk_size
+        self.use_task_id = use_task_id
 
         self._features, self.meta = load_cache(cache_dir, tag)
-        if self.meta["task_filter"] is None:
-            raise ValueError(
-                f"Cache {tag} has no task_filter set; head-only training "
-                "requires a single-task cache so action lookups are unambiguous."
-            )
 
         # Group cached samples by stem and load per-stem action tables.
         # `cache_index[stem][frame_idx]` -> row in the memmap.
@@ -339,7 +353,8 @@ class CachedFeatureDataset(th.utils.data.Dataset):
         self.samples: list[tuple[str, int]] = []
 
         root = Path(data_root)
-        for traj_dir in _iter_trajectory_dirs(root, self.meta["task_filter"]):
+        # task_filter=None scans every trajectory_task_* dir (combined cache).
+        for traj_dir in _iter_trajectory_dirs(root, self.meta.get("task_filter")):
             all_actions_path = traj_dir / "all_actions.json"
             if not all_actions_path.exists():
                 continue
@@ -361,8 +376,23 @@ class CachedFeatureDataset(th.utils.data.Dataset):
                     if idx in cache_index[stem]:
                         self.samples.append((stem, idx))
 
+        if use_task_id:
+            tasks = sorted({_task_from_stem(s) for s in self.targets_by_stem})
+            self.task_names: list[str] = tasks
+            self.task_id_by_stem: dict[str, int] = {
+                stem: tasks.index(_task_from_stem(stem)) for stem in self.targets_by_stem
+            }
+            self.n_tasks = len(tasks)
+        else:
+            self.task_names = []
+            self.task_id_by_stem = {}
+            self.n_tasks = 0
+
     def feature_dim(self) -> int:
         return int(self.meta["feature_dim"])
+
+    def task_id_dim(self) -> int:
+        return self.n_tasks
 
     def _past(self, stem: str, frame_idx: int) -> th.Tensor:
         if self.past_action_k == 0:
@@ -375,6 +405,13 @@ class CachedFeatureDataset(th.utils.data.Dataset):
             past[self.past_action_k - n_valid :] = onehots[start:frame_idx]
         return th.from_numpy(past.reshape(-1))
 
+    def _task_onehot(self, stem: str) -> th.Tensor:
+        if not self.use_task_id:
+            return th.zeros(0, dtype=th.float32)
+        oh = th.zeros(self.n_tasks, dtype=th.float32)
+        oh[self.task_id_by_stem[stem]] = 1.0
+        return oh
+
     def __len__(self) -> int:
         return len(self.samples)
 
@@ -386,7 +423,7 @@ class CachedFeatureDataset(th.utils.data.Dataset):
         target = th.from_numpy(
             self.targets_by_stem[stem][frame_idx : frame_idx + self.chunk_size]
         )
-        return feat, target, self._past(stem, frame_idx)
+        return feat, target, self._past(stem, frame_idx), self._task_onehot(stem)
 
 
 class HeadOnlyAgent(th.nn.Module):
@@ -394,6 +431,10 @@ class HeadOnlyAgent(th.nn.Module):
 
     Mirrors `VLAAgent.action_head` exactly, so a checkpoint trained on cached
     features is structurally identical to the head trained end-to-end.
+
+    `task_id_dim>0` adds a one-hot task ID to the head input. Used to give a
+    no-language combined-dataset model task-disambiguation without language —
+    isolates "task-aware multi-task" from "language-aware multi-task".
     """
 
     def __init__(
@@ -401,6 +442,7 @@ class HeadOnlyAgent(th.nn.Module):
         feature_dim: int,
         output_dim: int,
         past_action_dim: int = 0,
+        task_id_dim: int = 0,
         chunk_size: int = 1,
         hidden_dim: int | None = None,
     ):
@@ -408,21 +450,32 @@ class HeadOnlyAgent(th.nn.Module):
         self.feature_dim = feature_dim
         self.output_dim = output_dim
         self.past_action_dim = past_action_dim
+        self.task_id_dim = task_id_dim
         self.chunk_size = chunk_size
         self.hidden_dim = hidden_dim or feature_dim
         self.action_head = th.nn.Sequential(
-            th.nn.Linear(feature_dim + past_action_dim, self.hidden_dim),
+            th.nn.Linear(feature_dim + past_action_dim + task_id_dim, self.hidden_dim),
             th.nn.ReLU(),
             th.nn.Linear(self.hidden_dim, output_dim * chunk_size),
         )
 
-    def forward(self, features: th.Tensor, past_actions: th.Tensor | None = None) -> th.Tensor:
+    def forward(
+        self,
+        features: th.Tensor,
+        past_actions: th.Tensor | None = None,
+        task_id: th.Tensor | None = None,
+    ) -> th.Tensor:
         x = features
         if self.past_action_dim > 0:
             if past_actions is None:
                 raise ValueError("past_actions required when past_action_dim > 0")
             past = past_actions.to(x.device).to(x.dtype)
             x = th.cat([x, past], dim=-1)
+        if self.task_id_dim > 0:
+            if task_id is None:
+                raise ValueError("task_id required when task_id_dim > 0")
+            tid = task_id.to(x.device).to(x.dtype)
+            x = th.cat([x, tid], dim=-1)
         flat = self.action_head(x)
         return flat.view(flat.size(0), self.chunk_size, self.output_dim)
 

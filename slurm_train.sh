@@ -24,7 +24,7 @@ echo "Started: $(date)"
 REPO_ROOT="${REPO_ROOT:-$HOME/BIG}"
 cd "$REPO_ROOT"
 
-# Activate venv (created once: python3.11 -m venv "$REPO_ROOT/.venv")
+# Activate venv (created once: python3.12 -m venv "$REPO_ROOT/.venv")
 source "$REPO_ROOT/.venv/bin/activate"
 
 # Performance settings
@@ -34,12 +34,16 @@ export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128
 mkdir -p logs
 
 # ---------- ablation-cell selectors (one job per cell) ----------------------
-#   BACKBONE: llava | clip
-#   TASK_FILTER: e.g. chop_a_tree, collect_dirt
-#   USE_LANGUAGE: 1 | 0
+#   BACKBONE: llava | clip          (frozen backbone)
+#   USE_LANGUAGE: 1 | 0             (0 -> text prompt zeroed in the encoder)
+#   USE_TASK_ID: 1 | 0              (1 -> one-hot task ID concatenated to head input)
+#   TASK_FILTER (optional): substring of trajectory_task_<task>_*. If unset,
+#       the cache is built on the union of every trajectory_task_* dir found
+#       under DATA_DIR (the standard combined-dataset ablation cell).
 BACKBONE="${BACKBONE:-llava}"
-TASK_FILTER="${TASK_FILTER:?Set TASK_FILTER (e.g. chop_a_tree or collect_dirt)}"
 USE_LANGUAGE="${USE_LANGUAGE:-1}"
+USE_TASK_ID="${USE_TASK_ID:-0}"
+TASK_FILTER="${TASK_FILTER:-}"        # empty = combined cache across both tasks
 
 EPOCHS="${EPOCHS:-10}"
 BATCH_SIZE="${BATCH_SIZE:-256}"
@@ -56,6 +60,11 @@ PAST_ACTION_K="${PAST_ACTION_K:-8}"
 CHUNK_SIZE="${CHUNK_SIZE:-8}"
 
 LANG_TAG=$([ "$USE_LANGUAGE" = "1" ] && echo lang || echo nolang)
+TASK_TAG=${TASK_FILTER:-combined}
+TASKID_SUFFIX=""
+if [ "$USE_TASK_ID" = "1" ]; then
+    TASKID_SUFFIX="_taskid"
+fi
 
 # ---------- storage layout --------------------------------------------------
 # /var/tmp1 is the local NVMe on Abaki nodes (1 TB on 1N, 2 TB on 2N).
@@ -67,7 +76,7 @@ mkdir -p "$NODE_SCRATCH"
 DATA_TARBALL_DIR="$REPO_ROOT/trajectories"            # persistent tarballs
 DATA_DIR="$NODE_SCRATCH/trajectories"                 # extracted, per node
 CACHE_DIR="$NODE_SCRATCH/caches"                      # survives across jobs
-OUTPUT_DIR="$REPO_ROOT/output/${BACKBONE}_${TASK_FILTER}_${LANG_TAG}"
+OUTPUT_DIR="$REPO_ROOT/output/${BACKBONE}_${TASK_TAG}_${LANG_TAG}${TASKID_SUFFIX}"
 
 export HF_HOME="$NODE_SCRATCH/hf_cache"
 export TRANSFORMERS_CACHE="$HF_HOME/transformers"
@@ -82,32 +91,63 @@ mkdir -p "$DATA_DIR" "$CACHE_DIR" "$OUTPUT_DIR" "$HF_HOME"
 #   2. consolidate_metadata.py walks the extracted dir and writes
 #      all_actions.json + all_infos.json once.
 # Both steps are idempotent so reruns on the same node are no-ops.
-TRAJ_SUBDIR="$DATA_DIR/trajectory_task_${TASK_FILTER}_length_3000"
-if [ ! -f "$TRAJ_SUBDIR/all_actions.json" ]; then
-    TARBALL=$(ls "$DATA_TARBALL_DIR"/trajectory_task_${TASK_FILTER}_*.tar.gz 2>/dev/null | head -1 || true)
-    if [ -z "$TARBALL" ]; then
-        echo "ERROR: no tarball matching trajectory_task_${TASK_FILTER}_*.tar.gz under $DATA_TARBALL_DIR" >&2
+# When TASK_FILTER is empty we need BOTH tarballs staged for the combined cache.
+if [ -n "$TASK_FILTER" ]; then
+    STAGE_TASKS=("$TASK_FILTER")
+else
+    STAGE_TASKS=()
+    for f in "$DATA_TARBALL_DIR"/trajectory_task_*.tar.gz; do
+        [ -e "$f" ] || continue
+        name=$(basename "$f" .tar.gz)            # trajectory_task_<task>_length_3000
+        task=${name#trajectory_task_}
+        task=${task%_length_*}
+        STAGE_TASKS+=("$task")
+    done
+    if [ ${#STAGE_TASKS[@]} -eq 0 ]; then
+        echo "ERROR: no trajectory_task_*.tar.gz under $DATA_TARBALL_DIR" >&2
         exit 1
     fi
-    if [ ! -d "$TRAJ_SUBDIR" ]; then
-        echo "Extracting $TARBALL -> $DATA_DIR (strip AAA_trajectory/ wrapper)"
-        tar -xzf "$TARBALL" -C "$DATA_DIR" --strip-components=1
-    else
-        echo "Already extracted: $TRAJ_SUBDIR (missing consolidated JSON only)"
-    fi
-    echo "Consolidating per-video JSONLs -> all_actions.json + all_infos.json"
-    python consolidate_metadata.py --data-dir "$DATA_DIR" --delete-originals
-else
-    echo "Trajectory + consolidated JSON already staged: $TRAJ_SUBDIR"
 fi
 
-echo "Cell: backbone=$BACKBONE  task=$TASK_FILTER  use_language=$USE_LANGUAGE"
+NEED_CONSOLIDATE=0
+for TASK in "${STAGE_TASKS[@]}"; do
+    TRAJ_SUBDIR="$DATA_DIR/trajectory_task_${TASK}_length_3000"
+    if [ ! -f "$TRAJ_SUBDIR/all_actions.json" ]; then
+        TARBALL=$(ls "$DATA_TARBALL_DIR"/trajectory_task_${TASK}_*.tar.gz 2>/dev/null | head -1 || true)
+        if [ -z "$TARBALL" ]; then
+            echo "ERROR: no tarball matching trajectory_task_${TASK}_*.tar.gz under $DATA_TARBALL_DIR" >&2
+            exit 1
+        fi
+        if [ ! -d "$TRAJ_SUBDIR" ]; then
+            echo "Extracting $TARBALL -> $DATA_DIR (strip AAA_trajectory/ wrapper)"
+            tar -xzf "$TARBALL" -C "$DATA_DIR" --strip-components=1
+        else
+            echo "Already extracted: $TRAJ_SUBDIR (missing consolidated JSON only)"
+        fi
+        NEED_CONSOLIDATE=1
+    else
+        echo "Trajectory + consolidated JSON already staged: $TRAJ_SUBDIR"
+    fi
+done
+
+if [ "$NEED_CONSOLIDATE" = "1" ]; then
+    echo "Consolidating per-video JSONLs -> all_actions.json + all_infos.json"
+    python consolidate_metadata.py --data-dir "$DATA_DIR" --delete-originals
+fi
+
+echo "Cell: backbone=$BACKBONE  task_filter=${TASK_FILTER:-<combined>}  use_language=$USE_LANGUAGE  use_task_id=$USE_TASK_ID"
 echo "Past-action K=$PAST_ACTION_K  chunk=$CHUNK_SIZE  epochs=$EPOCHS  batch=$BATCH_SIZE  lr=$LR"
 echo "Data=$DATA_DIR  cache=$CACHE_DIR  output=$OUTPUT_DIR  HF_HOME=$HF_HOME"
 
-NO_LANGUAGE_FLAG=""
+EXTRA_FLAGS=()
 if [ "$USE_LANGUAGE" != "1" ]; then
-    NO_LANGUAGE_FLAG="--no-language"
+    EXTRA_FLAGS+=("--no-language")
+fi
+if [ -n "$TASK_FILTER" ]; then
+    EXTRA_FLAGS+=("--task-filter" "$TASK_FILTER")
+fi
+if [ "$USE_TASK_ID" = "1" ]; then
+    EXTRA_FLAGS+=("--task-id")
 fi
 
 # ---------- run -------------------------------------------------------------
@@ -116,7 +156,6 @@ python cluster_pipeline.py \
     --cache-dir "$CACHE_DIR" \
     --output-dir "$OUTPUT_DIR" \
     --backbone "$BACKBONE" \
-    --task-filter "$TASK_FILTER" \
     --past-action-k "$PAST_ACTION_K" \
     --chunk-size "$CHUNK_SIZE" \
     --epochs "$EPOCHS" \
@@ -125,6 +164,6 @@ python cluster_pipeline.py \
     --lr "$LR" \
     --device cuda \
     --num-workers 8 \
-    $NO_LANGUAGE_FLAG
+    "${EXTRA_FLAGS[@]}"
 
 echo "Finished: $(date)"
