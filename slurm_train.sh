@@ -29,7 +29,11 @@ source "$REPO_ROOT/.venv/bin/activate"
 
 # Performance settings
 export OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK:-8}
-export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128
+# expandable_segments helps PyTorch reclaim fragmented blocks instead of OOMing
+# when the asked-for chunk doesn't fit in any single free segment. The previous
+# max_split_size_mb=128 was tuned for a different cluster and made things worse
+# here (LLaVA OOM'd with 4.6 MiB free while 40 MiB sat reserved but unallocated).
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 mkdir -p logs
 
@@ -49,10 +53,10 @@ EPOCHS="${EPOCHS:-10}"
 BATCH_SIZE="${BATCH_SIZE:-256}"
 CACHE_BATCH_SIZE_DEFAULT=64
 if [ "$BACKBONE" = "llava" ]; then
-    # LLaVA-7B fp16 + activations at batch=64 OOMs on the A5000 24 GB
-    # (peak ~22.8 GiB, ask for 784 MiB more -> fail). batch=32 fits with
-    # ~5 GiB headroom and still ~2x faster than the previous batch=16.
-    CACHE_BATCH_SIZE_DEFAULT=32
+    # LLaVA-7B fp16 OOMs at both batch=64 (~22.8 GiB) AND batch=32 (~23.3 GiB)
+    # on the A5000 24 GB under transformers 4.49 + the combined dataset. Only
+    # batch=16 reliably stays below the wall.
+    CACHE_BATCH_SIZE_DEFAULT=16
 fi
 CACHE_BATCH_SIZE="${CACHE_BATCH_SIZE:-$CACHE_BATCH_SIZE_DEFAULT}"
 LR="${LR:-1e-3}"
