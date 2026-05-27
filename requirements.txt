@@ -1,44 +1,31 @@
 # VLA Action Head Training Requirements
-# Tested with Python 3.11 on the LMU CIP Abaki cluster (RTX A5000, 24 GB).
+# Tested with Python 3.12 on the LMU CIP Abaki cluster (RTX A5000, 24 GB).
+# (Python 3.10 not available on LMU CIP; 3.11 lacks the python3.11-venv apt
+#  package and we don't have root — so 3.12 it is, which forces torch>=2.2.)
 
-# Core ML libraries (torch 2.1.0 supports Python 3.10–3.11)
-torch==2.1.0
-torchvision==0.16.0
-torchaudio==2.1.0
+# Core ML libraries (torch 2.2 is the first release with Python 3.12 wheels)
+torch>=2.2.0,<2.5.0
+torchvision>=0.17.0,<0.20.0
+torchaudio>=2.2.0,<2.5.0
 
 # Computer vision and image processing
 opencv-python>=4.5.0
 Pillow>=9.0.0
 
-# Transformers and LLaVA (pinned for torch 2.1.0)
+# Transformers and LLaVA
 transformers>=4.37.0,<4.45.0
 accelerate>=0.20.0,<0.35.0
 sentencepiece>=0.1.97
 
-# Data processing and utilities - capped at <1.24 for minerl compatibility
-numpy>=1.16.2,<1.24
+# Data processing and utilities
+numpy>=1.26.0,<2.0   # 1.26 is the first numpy with Python 3.12 wheels
 tqdm>=4.64.0
 scikit-learn>=1.1.0
 matplotlib>=3.5.0
 decord>=0.6.0  # MP4 random-access frame decoding for TrajectoryDataset
-
-# Additional scripts dependencies
-seaborn>=0.11.0  # For enhanced plotting in evaluate_model.py
-
-# MineRL and game environment
-# gym 0.21.0 has a broken setup.py; 0.23.1 is the highest version minerl v1.0 supports
-gym==0.23.1
-gym3>=0.3.3
-attrs>=21.4.0
-# minerl is installed from git inside the Dockerfile (v1.0)
-
-# Additional utilities
+seaborn>=0.11.0
 coloredlogs>=15.0
 
-# Built-in modules (no installation needed)
-# json - Python 3.10 built-in
-# argparse - Python 3.10 built-in  
-# pathlib - Python 3.10 built-in (pathlib2 not needed)
-# logging - Python 3.10 built-in
-# shutil - Python 3.10 built-in
-# time - Python 3.10 built-in
+# MineRL / gym are *not* installed here — they're rollout-only and ship inside
+# the Docker image (see Dockerfile). Adding gym 0.23.1 here would block install
+# on Python 3.12 with no benefit for training.
