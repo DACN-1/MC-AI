@@ -43,7 +43,14 @@ USE_LANGUAGE="${USE_LANGUAGE:-1}"
 
 EPOCHS="${EPOCHS:-10}"
 BATCH_SIZE="${BATCH_SIZE:-256}"
-CACHE_BATCH_SIZE="${CACHE_BATCH_SIZE:-64}"
+CACHE_BATCH_SIZE_DEFAULT=64
+if [ "$BACKBONE" = "llava" ]; then
+    # LLaVA-7B fp16 + activations at batch=64 OOMs on the A5000 24 GB
+    # (peak ~22.8 GiB, ask for 784 MiB more -> fail). batch=32 fits with
+    # ~5 GiB headroom and still ~2x faster than the previous batch=16.
+    CACHE_BATCH_SIZE_DEFAULT=32
+fi
+CACHE_BATCH_SIZE="${CACHE_BATCH_SIZE:-$CACHE_BATCH_SIZE_DEFAULT}"
 LR="${LR:-1e-3}"
 PAST_ACTION_K="${PAST_ACTION_K:-8}"
 CHUNK_SIZE="${CHUNK_SIZE:-8}"
