@@ -61,15 +61,43 @@ def _ensure_cache(
     cache_batch_size: int,
     device: str,
 ) -> str:
+    """Build (or resume) the feature cache, returning the tag.
+
+    `precompute` writes the full-size .npy memmap and metadata up-front and
+    only fills the memmap incrementally — so "files exist" is NOT a complete-
+    cache signal. We have to consult the .progress cursor too, otherwise a
+    job killed mid-build leaves a partial cache that the next run would
+    silently treat as done and train a head on 99% zeros.
+    """
+    import json as _json
     from feature_cache import precompute  # lazy import — only needed for cached path
 
     tag = _cache_tag(backbone, task_filter, use_language)
     cache_npy = cache_dir / f"{tag}.npy"
     cache_meta = cache_dir / f"{tag}.json"
+    progress_path = cache_dir / f"{tag}.progress"
+
     if cache_npy.exists() and cache_meta.exists():
-        print(f"[cache] {tag}: reusing {cache_npy} ({cache_npy.stat().st_size / 1024 ** 3:.2f} GB)")
-        return tag
-    print(f"[cache] {tag}: not found — building (one-time, ~hours for LLaVA)")
+        try:
+            n_samples = int(_json.loads(cache_meta.read_text()).get("n_samples", 0))
+        except (ValueError, OSError, KeyError):
+            n_samples = 0
+        progress = 0
+        if progress_path.exists():
+            try:
+                progress = int(progress_path.read_text().strip() or "0")
+            except (ValueError, OSError):
+                progress = 0
+        if n_samples > 0 and progress >= n_samples:
+            print(
+                f"[cache] {tag}: reusing complete cache "
+                f"({cache_npy.stat().st_size / 1024 ** 3:.2f} GB, {progress:,}/{n_samples:,})"
+            )
+            return tag
+        print(f"[cache] {tag}: partial ({progress:,}/{n_samples:,}) — resuming")
+    else:
+        print(f"[cache] {tag}: not found — building (one-time, ~hours for LLaVA)")
+
     precompute(
         data_root=data_dir,
         cache_dir=cache_dir,
