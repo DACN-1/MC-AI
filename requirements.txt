@@ -13,8 +13,11 @@ opencv-python>=4.5.0
 Pillow>=9.0.0
 
 # Transformers and LLaVA
-transformers>=4.37.0,<4.45.0
-accelerate>=0.20.0,<0.35.0
+# transformers 4.45+ ships tokenizers 0.20+, which is required to parse the
+# newer tokenizer.json format LLaVA-1.5-7b uses. 4.44 + tokenizers 0.19 fails
+# with "data did not match any variant of untagged enum ModelWrapper" at load.
+transformers>=4.45.0,<4.50.0
+accelerate>=0.30.0
 sentencepiece>=0.1.97
 
 # Data processing and utilities
