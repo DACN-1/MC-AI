@@ -177,15 +177,24 @@ python run_rollout.py \
     --record-video
 ```
 
-### 4. SLURM (one job per ablation cell)
+### 4. SLURM (one job per ablation cell — LMU CIP Abaki partition)
 
 `slurm_train.sh` runs `cluster_pipeline.py` for one (backbone × task × language)
-cell. Selectors come from env vars; the first job for a given cell builds the
-cache (~26 h LLaVA, ~6 h CLIP), every subsequent job for the same cell reuses
-it and finishes in ~30 min of head training. Drop `--time` to 04:00:00 once
-all caches exist.
+cell on the `Abaki` partition (RTX A5000 24 GB). Selectors come from env vars.
+The script stages tarballs from `~/BIG/trajectories` onto the compute node's
+`/var/tmp1` and points the cache there too. The first job for a given cell
+builds the cache (~26 h LLaVA, ~6 h CLIP); subsequent jobs on the same node
+reuse it and finish in ~30 min — until the next weekly reboot wipes
+`/var/tmp1`, at which point `feature_cache.precompute` resumes from the
+recorded cursor.
 
 ```bash
+# One-time on the cluster:
+python3.11 -m venv ~/BIG/.venv
+source ~/BIG/.venv/bin/activate
+pip install -r ~/BIG/requirements.txt
+bash ~/BIG/download_llava.sh   # optional: pre-warm HF cache
+
 # Build cache + train one cell (LLaVA + chop_a_tree + prompt)
 BACKBONE=llava TASK_FILTER=chop_a_tree USE_LANGUAGE=1 sbatch slurm_train.sh
 
@@ -199,7 +208,7 @@ for backbone in llava clip; do
 done
 ```
 
-Output is auto-tagged: `output/<backbone>_<task>_<lang|nolang>/{model.pt, metrics.json}`.
+Output is auto-tagged: `~/BIG/output/<backbone>_<task>_<lang|nolang>/{model.pt, metrics.json}`.
 
 ### 5. MineRL inside Docker (Apple Silicon-friendly)
 ```bash
@@ -277,10 +286,9 @@ and head output is `NUM_OUTPUT_LOGITS * chunk_size`. Pre-temporal checkpoints
 
 ## Dependencies
 
-Pinned in `requirements.txt` for the JURECA cluster (Python 3.10, torch 2.1.0
-+ CUDA 11.7, transformers <4.45). MineRL v1.0 + gym 0.23.1 are required for the
-rollout path; everything else only needs the ML stack + `decord` for frame
-decoding.
+Pinned in `requirements.txt` for LMU CIP Abaki (Python 3.11, torch 2.1.0,
+transformers <4.45). MineRL v1.0 + gym 0.23.1 are required for the rollout
+path; everything else only needs the ML stack + `decord` for frame decoding.
 
 ## Resumability
 
@@ -323,7 +331,10 @@ With `feature_cache.precompute` running first:
 | **Total with caching, 2 tasks** | **~128 h (~5.3 days)** | **~4 h** |
 
 Cache storage: ~25 GB per LLaVA tag (FP16 × 4096 dims) + ~10 GB per CLIP tag
-(FP16 × ~1536 dims) ≈ **140 GB total** — fits the 2 TB NVMe easily.
+(FP16 × ~1536 dims) ≈ **140 GB total** — fits `/var/tmp1` (1 TB on the 1N
+nodes, 2 TB on the 2N nodes) easily. The cache wipes on weekly reboot;
+`feature_cache.precompute`'s atomic progress sidecar resumes the rebuild from
+the last batch.
 
 Per-sample times are public-benchmark estimates for A5000 + FP16; expect
 ±50%. Measure on one mini-run before committing.

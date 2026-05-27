@@ -1,126 +1,43 @@
 #!/bin/bash
-# Download LLaVA model for offline cluster training
-# Run this on JURECA DC LOGIN NODE (with internet access)
+# Pre-download LLaVA weights into the HF cache so the first SLURM job
+# doesn't spend an hour pulling from huggingface.co on the compute node.
+# Run from the login node (it has internet; compute nodes do too on LMU CIP,
+# so this script is optional — it just avoids the first-job download hit).
 
-set -e  # Exit on any error
+set -euo pipefail
 
-echo "🚀 LLaVA Model Download Script for JURECA DC"
-echo "============================================="
-echo "This script must be run on the LOGIN NODE (with internet access)"
-echo "Date: $(date)"
-echo "User: $USER"
-echo "Host: $(hostname)"
-echo ""
+REPO_ROOT="${REPO_ROOT:-$HOME/BIG}"
+HF_HOME="${HF_HOME:-/var/tmp1/$USER/hf_cache}"
+MODEL="${LLAVA_MODEL:-llava-hf/llava-1.5-7b-hf}"
 
-# Check if we're on login node (basic check)
-if [[ $(hostname) != *"login"* ]] && [[ $(hostname) != *"jureca"* ]]; then
-    echo "⚠️  Warning: This doesn't look like a login node"
-    echo "   Make sure you have internet access before continuing"
-    echo ""
-fi
+echo "Host:    $(hostname)"
+echo "Repo:    $REPO_ROOT"
+echo "HF_HOME: $HF_HOME"
+echo "Model:   $MODEL"
 
-# Load required modules for Python 3.10
-echo "📦 Loading required modules..."
-module load Stages/2023
-module load GCC/11.3.0
-module load Python/3.10.4
-module load CUDA/11.7
-
-echo "✅ Modules loaded"
-echo "Python: $(python --version)"
-echo ""
-
-# Check if virtual environment exists
-if [ ! -d ".venv" ]; then
-    echo "❌ Virtual environment not found!"
-    echo "Please create it first:"
-    echo "   python3.10 -m venv .venv"
-    echo "   source .venv/bin/activate" 
-    echo "   pip install -r requirements.txt"
+if [ ! -d "$REPO_ROOT/.venv" ]; then
+    echo "ERROR: venv not found at $REPO_ROOT/.venv" >&2
+    echo "Create it once:  python3.11 -m venv $REPO_ROOT/.venv && source $REPO_ROOT/.venv/bin/activate && pip install -r $REPO_ROOT/requirements.txt" >&2
     exit 1
 fi
 
-# Activate virtual environment
-echo "🔧 Activating virtual environment..."
-source .venv/bin/activate
+source "$REPO_ROOT/.venv/bin/activate"
 
-# Verify Python and packages
-echo "✅ Environment activated"
-echo "Python path: $(which python)"
-echo "Pip packages:"
-pip list | grep -E "(torch|transformers)" || echo "⚠️  Required packages not found"
-echo ""
+export HF_HOME
+export TRANSFORMERS_CACHE="$HF_HOME/transformers"
+mkdir -p "$HF_HOME"
 
-# Check internet connectivity
-echo "🌐 Testing internet connectivity..."
-if curl -s --connect-timeout 5 https://huggingface.co > /dev/null; then
-    echo "✅ Internet connection OK"
-else
-    echo "❌ No internet connection!"
-    echo "This script must run on a login node with internet access"
+if ! curl -s --connect-timeout 5 https://huggingface.co > /dev/null; then
+    echo "ERROR: huggingface.co not reachable from $(hostname)" >&2
     exit 1
 fi
-echo ""
 
-# Check disk space
-echo "💾 Checking disk space..."
-df -h . | head -2
-echo ""
+echo "Downloading $MODEL into $HF_HOME (~13 GB, takes 10-15 min) …"
+python - <<PY
+from transformers import LlavaProcessor, LlavaForConditionalGeneration
+LlavaProcessor.from_pretrained("$MODEL")
+LlavaForConditionalGeneration.from_pretrained("$MODEL")
+print("OK")
+PY
 
-AVAILABLE=$(df . | tail -1 | awk '{print $4}')
-if [ $AVAILABLE -lt 15728640 ]; then  # 15 GB in KB
-    echo "⚠️  Warning: Less than 15 GB available space"
-    echo "   LLaVA model requires ~13 GB"
-    read -p "   Continue anyway? (y/N): " -n 1 -r
-    echo ""
-    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-        echo "Aborted"
-        exit 1
-    fi
-fi
-
-# Create cache directory
-echo "📁 Setting up cache directory..."
-mkdir -p hf_cache
-export HF_HOME="$(pwd)/hf_cache"
-export TRANSFORMERS_CACHE="$(pwd)/hf_cache/transformers"
-
-echo "Cache directory: $HF_HOME"
-echo ""
-
-# Run Python download script
-echo "🐍 Starting Python download script..."
-echo "This will take 10-15 minutes for ~13 GB download"
-echo ""
-
-python download_llava.py
-
-# Check if download was successful
-if [ $? -eq 0 ]; then
-    echo ""
-    echo "🎉 SUCCESS! LLaVA model downloaded successfully"
-    echo ""
-    echo "📊 Cache information:"
-    echo "Size: $(du -sh hf_cache | cut -f1)"
-    echo "Location: $(pwd)/hf_cache"
-    echo ""
-    echo "📋 Next steps:"
-    echo "1. Your model is ready for offline training"
-    echo "2. Submit your training job: sbatch slurm_train.sh"
-    echo "3. The job will automatically use the cached model"
-    echo ""
-    echo "🔧 Environment setup for manual use:"
-    echo "   source set_hf_cache.sh"
-    echo ""
-else
-    echo ""
-    echo "❌ FAILED! Download unsuccessful"
-    echo "Check the error messages above"
-    echo ""
-    echo "🛠️  Troubleshooting:"
-    echo "- Verify internet connection: curl https://huggingface.co"
-    echo "- Check Python packages: pip list | grep transformers"
-    echo "- Try manual installation: pip install --upgrade transformers torch"
-    echo ""
-    exit 1
-fi
+echo "Done. Cache size: $(du -sh "$HF_HOME" | cut -f1)"

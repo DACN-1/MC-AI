@@ -1,7 +1,7 @@
-# Python 3.10 VLA Action Head Training Requirements
-# Compatible with Python 3.10.4+ on JURECA DC cluster
+# VLA Action Head Training Requirements
+# Tested with Python 3.11 on the LMU CIP Abaki cluster (RTX A5000, 24 GB).
 
-# Core ML libraries - CUDA 11.7 compatible versions
+# Core ML libraries (torch 2.1.0 supports Python 3.10–3.11)
 torch==2.1.0
 torchvision==0.16.0
 torchaudio==2.1.0
@@ -10,7 +10,7 @@ torchaudio==2.1.0
 opencv-python>=4.5.0
 Pillow>=9.0.0
 
-# Transformers and LLaVA - Python 3.10 compatible (pinned for torch 2.1.0)
+# Transformers and LLaVA (pinned for torch 2.1.0)
 transformers>=4.37.0,<4.45.0
 accelerate>=0.20.0,<0.35.0
 sentencepiece>=0.1.97
