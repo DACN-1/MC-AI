@@ -5,11 +5,14 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=8
-#SBATCH --time=4-00:00:00
-# ^ LLaVA cache build ~26 h + head train < 1 h fits inside Abaki's 5-day cap
-#   with margin. After the cache exists on this node's /var/tmp1, subsequent
-#   jobs for the same cell take ~30 min — override with --time=04:00:00 then.
-#SBATCH --mem=64G
+#SBATCH --time=2-00:00:00
+# ^ Must stay inside the weekly compvis26 reservation window
+#   (Sat 06:00 -> Mon 06:00 holds every Abaki node). 48 h covers an LLaVA
+#   cache build (~26 h) + head train (< 1 h) with ±50% slack. Subsequent
+#   cache-hit runs take ~30 min — override with --time=04:00:00 then.
+# Note: no --mem here. SLURM on LMU CIP tracks RealMemory=1 (misconfigured),
+# so any --mem request is rejected. The OS hands us actual RAM regardless
+# (128 GB on 1N nodes, 512 GB on 2N).
 #SBATCH --output=logs/slurm_%j.out
 #SBATCH --error=logs/slurm_%j.err
 
