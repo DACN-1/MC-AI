@@ -35,9 +35,13 @@ def consolidate_actions(actions_dir: Path, output_file: Path, delete_originals: 
 
         consolidated[stem] = actions
 
-    # Write consolidated file
-    with output_file.open("w", encoding="utf-8") as fp:
-        json.dump(consolidated, fp, separators=(',', ':'))  # Compact JSON
+    # Atomic write: tmp + rename. A mid-write crash would otherwise leave a
+    # half-written JSON that downstream readers (feature_cache.enumerate_samples)
+    # would silently skip, producing a partial training set.
+    tmp = output_file.with_suffix(output_file.suffix + ".tmp")
+    with tmp.open("w", encoding="utf-8") as fp:
+        json.dump(consolidated, fp, separators=(',', ':'))
+    tmp.replace(output_file)
 
     if delete_originals and action_files:
         for f in action_files:
@@ -70,9 +74,11 @@ def consolidate_infos(infos_dir: Path, output_file: Path, delete_originals: bool
 
         consolidated[stem] = info_data
 
-    # Write consolidated file
-    with output_file.open("w", encoding="utf-8") as fp:
-        json.dump(consolidated, fp, separators=(',', ':'))  # Compact JSON
+    # Atomic write: tmp + rename (see consolidate_actions for rationale).
+    tmp = output_file.with_suffix(output_file.suffix + ".tmp")
+    with tmp.open("w", encoding="utf-8") as fp:
+        json.dump(consolidated, fp, separators=(',', ':'))
+    tmp.replace(output_file)
 
     if delete_originals and info_files:
         for f in info_files:

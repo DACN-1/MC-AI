@@ -60,13 +60,20 @@ def enumerate_samples(
     """Return (mp4_path, frame_idx, task_text, stem) tuples in cache-order.
 
     Mirrors TrajectoryDataset's loading logic but with deterministic sorting so
-    cache writes and reads agree on indexing.
+    cache writes and reads agree on indexing. Logs a per-task-dir breakdown and
+    raises if any directory contributes zero samples — silent partial loads
+    previously wasted an entire training run.
     """
     root = Path(data_root)
     samples: list[tuple[str, int, str, str]] = []
+    per_dir_counts: dict[str, int] = {}
+    skipped_no_actions: list[str] = []
+    skipped_no_video: list[str] = []
     for traj_dir in _iter_trajectory_dirs(root, task_filter):
         all_actions_path = traj_dir / "all_actions.json"
         if not all_actions_path.exists():
+            skipped_no_actions.append(traj_dir.name)
+            per_dir_counts[traj_dir.name] = 0
             continue
         with all_actions_path.open("r", encoding="utf-8") as fp:
             all_actions = json.load(fp)
@@ -76,14 +83,42 @@ def enumerate_samples(
             with all_infos_path.open("r", encoding="utf-8") as fp:
                 all_infos = json.load(fp)
         videos_dir = traj_dir / "videos"
+        dir_n = 0
         for stem in sorted(all_actions.keys()):
             mp4_file = videos_dir / f"video_{stem}.mp4"
             if not mp4_file.exists():
+                skipped_no_video.append(stem)
                 continue
             task_text = all_infos.get(stem, {}).get("text_prompt", "play minecraft")
             actions = all_actions[stem]
             for idx in range(len(actions)):
                 samples.append((str(mp4_file), idx, task_text, stem))
+                dir_n += 1
+        per_dir_counts[traj_dir.name] = dir_n
+
+    print("[enumerate_samples] per-task-dir sample counts:")
+    for name, n in per_dir_counts.items():
+        print(f"  {name}: {n:,}")
+    print(f"  TOTAL: {len(samples):,}")
+    if skipped_no_actions:
+        raise RuntimeError(
+            "enumerate_samples: trajectory dirs without all_actions.json: "
+            f"{skipped_no_actions} — refusing to silently train on partial data"
+        )
+    empty_dirs = [name for name, n in per_dir_counts.items() if n == 0]
+    if empty_dirs:
+        raise RuntimeError(
+            f"enumerate_samples: empty trajectory dirs (zero samples): {empty_dirs} "
+            f"under {data_root} — likely missing videos/ contents"
+        )
+    if skipped_no_video:
+        # Hard fail rather than silent skip: missing MP4s mean partial data,
+        # which silently changes the dataset composition.
+        raise RuntimeError(
+            f"enumerate_samples: {len(skipped_no_video)} stems had no matching "
+            f"video_<stem>.mp4 under videos/ (e.g. {skipped_no_video[:3]}) — "
+            "refusing to train on partial trajectories"
+        )
     return samples
 
 
@@ -203,12 +238,17 @@ def precompute(
     if cache_path.exists() and meta_path.exists():
         with meta_path.open() as fp:
             meta_existing = json.load(fp)
+        # llava_id is checked only for the LLaVA backbone — CLIP does not store
+        # an HF model id in its metadata. Without this check we would happily
+        # resume against a cache built with a different LLaVA checkpoint.
+        expected_llava_id = llava_id if backbone == "llava" else None
         matches = (
             meta_existing.get("n_samples") == len(samples)
             and meta_existing.get("feature_dim") == feature_dim
             and meta_existing.get("backbone") == backbone
             and meta_existing.get("use_language") == use_language
             and meta_existing.get("task_filter") == task_filter
+            and meta_existing.get("llava_id") == expected_llava_id
         )
         if matches:
             start_batch = _read_progress(progress_path)
@@ -345,6 +385,16 @@ class CachedFeatureDataset(th.utils.data.Dataset):
                 if stem not in cache_index:
                     continue
                 actions = all_actions[stem]
+                # range(last_valid + 1) is empty when chunk_size > len(actions),
+                # which silently drops the trajectory. Fail loud instead — for
+                # the BASALT 3000-frame trajectories with chunk_size<=8 this
+                # is purely a defensive check.
+                if chunk_size > len(actions):
+                    raise RuntimeError(
+                        f"chunk_size={chunk_size} exceeds trajectory length "
+                        f"{len(actions)} for stem={stem!r}; would silently drop "
+                        "this stem from the training set"
+                    )
                 self.targets_by_stem[stem] = np.stack(
                     [action_to_tensor(a).numpy() for a in actions]
                 ).astype(np.float32)

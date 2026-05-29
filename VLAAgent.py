@@ -26,9 +26,32 @@ class VLAAgent(nn.Module):
     ):
         super().__init__()
         self.processor = LlavaProcessor.from_pretrained(backbone)
-        self.llava = LlavaForConditionalGeneration.from_pretrained(
-            backbone, torch_dtype=th.float16
-        )
+        # FlashAttention-2 cuts both prefill time and the quadratic attention
+        # activation tensor. Combined with the hidden-state hook in encode(),
+        # this is what lets the LLaVA cache build run at batch=64+ on a 24 GB
+        # A5000. Fall back to sdpa on platforms without the flash-attn wheel
+        # (e.g. the macOS dev machine) — the encode output is numerically the
+        # same modulo standard fp16 reduction-order differences.
+        # FA2 must be initialised on the GPU directly. `from_pretrained` first
+        # places the model on CPU and then HF silently falls back to eager
+        # attention if it sees CPU placement at init time — so a later
+        # `.to("cuda")` does not re-enable FA2. Pass `device_map="cuda"` here
+        # to skip the CPU staging step. On macOS (no CUDA) fall back to the
+        # default CPU placement + sdpa attention.
+        cuda_available = th.cuda.is_available()
+        try:
+            self.llava = LlavaForConditionalGeneration.from_pretrained(
+                backbone,
+                torch_dtype=th.float16,
+                attn_implementation="flash_attention_2",
+                device_map="cuda" if cuda_available else None,
+            )
+        except (ImportError, ValueError):
+            self.llava = LlavaForConditionalGeneration.from_pretrained(
+                backbone,
+                torch_dtype=th.float16,
+                device_map="cuda" if cuda_available else None,
+            )
         # Freeze backbone
         for p in self.llava.parameters():
             p.requires_grad_(False)
@@ -74,16 +97,31 @@ class VLAAgent(nn.Module):
             padding=True,
         ).to(self.llava.device)
 
-        out = self.llava(
-            input_ids=inputs.input_ids,
-            attention_mask=inputs.attention_mask,
-            pixel_values=inputs.pixel_values,
-            output_hidden_states=True,
-        )
+        # Capture the final-layer hidden state via a forward hook on the LLaMA
+        # RMSNorm. Asking the model for `output_hidden_states=True` stashes all
+        # 32 layers (~10 GB at batch=64 on LLaVA-7B) and forces the cache build
+        # down to batch=16 on the A5000. The hook output is the same tensor
+        # that `hidden_states[-1]` would have returned.
+        lang_model = self.llava.language_model
+        norm = getattr(lang_model, "model", lang_model).norm
+        captured: dict[str, th.Tensor] = {}
+
+        def _grab(_mod, _args, output):
+            captured["h"] = output
+
+        handle = norm.register_forward_hook(_grab)
+        try:
+            self.llava(
+                input_ids=inputs.input_ids,
+                attention_mask=inputs.attention_mask,
+                pixel_values=inputs.pixel_values,
+            )
+        finally:
+            handle.remove()
 
         # LLaMA has no CLS token — mean-pool the last hidden state across the full
         # (image + text) sequence so the head sees both modalities.
-        pooled = out.hidden_states[-1].mean(dim=1)
+        pooled = captured["h"].mean(dim=1)
         head_dtype = self.action_head[0].weight.dtype
         return pooled.to(head_dtype)
 

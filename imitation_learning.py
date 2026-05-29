@@ -81,24 +81,57 @@ class TrajectoryDataset(Dataset):
         self._VideoReader = None
 
         root = Path(root_dir)
+        per_dir_counts: dict[str, int] = {}
 
-        for item in root.iterdir():
-            if not item.is_dir() or not item.name.startswith("trajectory_task_"):
-                continue
+        traj_dirs = [
+            item for item in sorted(root.iterdir())
+            if item.is_dir() and item.name.startswith("trajectory_task_")
+        ]
+        if not traj_dirs:
+            raise RuntimeError(
+                f"TrajectoryDataset: no trajectory_task_* dirs under {root}"
+            )
 
+        for item in traj_dirs:
+            before = len(self.samples)
             all_actions_path = item / "all_actions.json"
             if all_actions_path.exists():
                 self._load_consolidated(item, all_actions_path, item / "all_infos.json")
             else:
                 self._load_individual_files(item)
+            per_dir_counts[item.name] = len(self.samples) - before
+
+        # Fail loud on partial loads — a silent miss here previously trained
+        # a "combined" cell on chop-only data.
+        print("[TrajectoryDataset] per-task-dir sample counts:")
+        for name, n in per_dir_counts.items():
+            print(f"  {name}: {n:,}")
+        empty_dirs = [name for name, n in per_dir_counts.items() if n == 0]
+        if empty_dirs:
+            raise RuntimeError(
+                f"TrajectoryDataset: trajectory dirs contributed 0 samples: "
+                f"{empty_dirs} — likely missing all_actions.json / actions/ / videos/"
+            )
 
     def _add_samples(
         self, stem: str, actions: list, task_text: str, videos_dir: Path
     ) -> None:
+        # Missing MP4 = partial dataset. Silent skip previously masked an
+        # incomplete extraction; fail loud instead.
         mp4_file = videos_dir / f"video_{stem}.mp4"
         if not mp4_file.exists():
-            print(f"Warning: missing MP4 for {stem}, skipping")
-            return
+            raise RuntimeError(
+                f"missing video file {mp4_file} for stem={stem!r} — "
+                "refusing to train on a partially extracted trajectory dir"
+            )
+        # range(last_valid + 1) is empty when chunk_size > len(actions), which
+        # silently drops the stem. For the BASALT 3000-frame trajectories with
+        # chunk_size <= 8 this is purely defensive.
+        if self.chunk_size > len(actions):
+            raise RuntimeError(
+                f"chunk_size={self.chunk_size} exceeds trajectory length "
+                f"{len(actions)} for stem={stem!r}; would silently drop it"
+            )
 
         # Precompute per-stem target tensors (cam bin indices, NOT one-hots).
         self.targets_by_stem[stem] = np.stack(

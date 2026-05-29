@@ -50,12 +50,10 @@ TASK_FILTER="${TASK_FILTER:-}"        # empty = combined cache across both tasks
 EPOCHS="${EPOCHS:-10}"
 BATCH_SIZE="${BATCH_SIZE:-256}"
 CACHE_BATCH_SIZE_DEFAULT=64
-if [ "$BACKBONE" = "llava" ]; then
-    # LLaVA-7B fp16 OOMs at both batch=64 (~22.8 GiB) AND batch=32 (~23.3 GiB)
-    # on the A5000 24 GB under transformers 4.49 + the combined dataset. Only
-    # batch=16 reliably stays below the wall.
-    CACHE_BATCH_SIZE_DEFAULT=16
-fi
+# Pre-2026-05-29 the LLaVA path was capped at 16 because `output_hidden_states=True`
+# in VLAAgent.encode retained all 32 transformer layers (~10 GB) and batch=32/64
+# OOM'd on the A5000 24 GB. The encode hook + FlashAttention-2 fixed that; batch=64
+# now fits comfortably (~16 GB peak) and can be pushed higher if probing leaves room.
 CACHE_BATCH_SIZE="${CACHE_BATCH_SIZE:-$CACHE_BATCH_SIZE_DEFAULT}"
 LR="${LR:-1e-3}"
 PAST_ACTION_K="${PAST_ACTION_K:-8}"
@@ -117,8 +115,28 @@ for TASK in "${STAGE_TASKS[@]}"; do
             exit 1
         fi
         if [ ! -d "$TRAJ_SUBDIR" ]; then
-            echo "Extracting $TARBALL -> $DATA_DIR (strip AAA_trajectory/ wrapper)"
-            tar -xzf "$TARBALL" -C "$DATA_DIR" --strip-components=1
+            # The tarballs are inconsistent: chop_a_tree wraps content in
+            # AAA_trajectory/trajectory_task_<task>_length_3000/{actions,infos,videos},
+            # while collect_dirt wraps directly as AAA_trajectory/{actions,infos,videos}
+            # (no per-task subdir). Extract to a TASK-specific staging dir and
+            # then move the contents up into $TRAJ_SUBDIR regardless of which
+            # layout the tarball used. This silently-different layout silently
+            # produced a chop-only "combined" cache once — never again.
+            STAGE_TMP="$DATA_DIR/.stage_${TASK}_$$"
+            rm -rf "$STAGE_TMP"
+            mkdir -p "$STAGE_TMP"
+            echo "Extracting $TARBALL -> $STAGE_TMP (strip AAA_trajectory/ wrapper)"
+            tar -xzf "$TARBALL" -C "$STAGE_TMP" --strip-components=1
+            mkdir -p "$TRAJ_SUBDIR"
+            inner_dir="$STAGE_TMP/trajectory_task_${TASK}_length_3000"
+            if [ -d "$inner_dir" ]; then
+                # chop-style: tarball already nested the task subdir
+                mv "$inner_dir"/* "$TRAJ_SUBDIR"/
+            else
+                # dirt-style: tarball wrote actions/infos/videos at top of strip
+                mv "$STAGE_TMP"/* "$TRAJ_SUBDIR"/
+            fi
+            rm -rf "$STAGE_TMP"
         else
             echo "Already extracted: $TRAJ_SUBDIR (missing consolidated JSON only)"
         fi
@@ -132,6 +150,35 @@ if [ "$NEED_CONSOLIDATE" = "1" ]; then
     echo "Consolidating per-video JSONLs -> all_actions.json + all_infos.json"
     python consolidate_metadata.py --data-dir "$DATA_DIR" --delete-originals
 fi
+
+# ---------- post-stage content validation (fail-loud) -----------------------
+# A previous run silently trained on chop-only data because abakus22's
+# /var/tmp1 already had `all_actions.json` for collect_dirt but its `videos/`
+# directory was empty after a partial extract. The `[ ! -f all_actions.json ]`
+# skip above let the script proceed; feature_cache.enumerate_samples then
+# silently produced 3.2 M samples instead of 6.24 M. Validate every staged
+# task has BOTH a non-empty all_actions.json AND at least one video file.
+for TASK in "${STAGE_TASKS[@]}"; do
+    TRAJ_SUBDIR="$DATA_DIR/trajectory_task_${TASK}_length_3000"
+    ACTIONS_JSON="$TRAJ_SUBDIR/all_actions.json"
+    if [ ! -s "$ACTIONS_JSON" ]; then
+        echo "ERROR: $ACTIONS_JSON missing or empty after staging — refusing to train on partial data" >&2
+        exit 1
+    fi
+    n_stems=$(python -c "import json; print(len(json.load(open('$ACTIONS_JSON'))))")
+    n_videos=$(find "$TRAJ_SUBDIR/videos" -maxdepth 1 -name 'video_*.mp4' 2>/dev/null | wc -l | tr -d ' ')
+    echo "Stage check  $TASK: stems=$n_stems videos=$n_videos"
+    if [ "$n_stems" -eq 0 ] || [ "$n_videos" -eq 0 ]; then
+        echo "ERROR: trajectory_task_${TASK} has stems=$n_stems videos=$n_videos — refusing to train on empty data" >&2
+        exit 1
+    fi
+    # Soft check: stems and videos should be roughly equal; off by more than
+    # 5% means a partial extraction. Fail loud to force investigation.
+    if [ "$n_videos" -lt "$(( n_stems * 95 / 100 ))" ]; then
+        echo "ERROR: trajectory_task_${TASK} videos ($n_videos) < 95% of stems ($n_stems) — partial data, refusing" >&2
+        exit 1
+    fi
+done
 
 echo "Cell: backbone=$BACKBONE  task_filter=${TASK_FILTER:-<combined>}  use_language=$USE_LANGUAGE"
 echo "Past-action K=$PAST_ACTION_K  chunk=$CHUNK_SIZE  epochs=$EPOCHS  batch=$BATCH_SIZE  lr=$LR"

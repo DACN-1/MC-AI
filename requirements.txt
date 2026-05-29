@@ -20,6 +20,16 @@ transformers>=4.45.0,<4.50.0
 accelerate>=0.30.0
 sentencepiece>=0.1.97
 
+# FlashAttention-2: cuts LLaVA prefill activation memory + time. Linux-only
+# (the wheel needs CUDA); macOS dev machines fall back to sdpa attention via
+# the try/except in VLAAgent.__init__.
+#
+# flash-attn doesn't ship binary wheels on PyPI — only source dists — so we
+# pin to the official prebuilt wheel for our exact (cuda × torch × python ×
+# cxx11abi) combo. cu12.3 binaries are forward-compatible with the cu12.1
+# runtime that ships with torch 2.4.1+cu121 on the cluster.
+flash-attn @ https://github.com/Dao-AILab/flash-attention/releases/download/v2.6.3/flash_attn-2.6.3+cu123torch2.4cxx11abiFALSE-cp312-cp312-linux_x86_64.whl ; sys_platform == "linux"
+
 # Data processing and utilities
 numpy>=1.26.0,<2.0   # 1.26 is the first numpy with Python 3.12 wheels
 tqdm>=4.64.0
