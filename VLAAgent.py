@@ -38,6 +38,12 @@ class VLAAgent(nn.Module):
         # `.to("cuda")` does not re-enable FA2. Pass `device_map="cuda"` here
         # to skip the CPU staging step. On macOS (no CUDA) fall back to the
         # default CPU placement + sdpa attention.
+        # On Blackwell (RTX 5090, sm_120) there is no flash-attn wheel — stock
+        # flash-attn has no sm_120 kernel — so we run on sdpa there by design.
+        # With flash_attn absent, HF raises ImportError (CPU-only → ValueError),
+        # both caught below. If a dirty base image ships a stock flash-attn whose
+        # kernel rejects sm_120, the failure surfaces as a RuntimeError at load —
+        # caught too, so the sdpa retry still fires.
         cuda_available = th.cuda.is_available()
         try:
             self.llava = LlavaForConditionalGeneration.from_pretrained(
@@ -46,7 +52,7 @@ class VLAAgent(nn.Module):
                 attn_implementation="flash_attention_2",
                 device_map="cuda" if cuda_available else None,
             )
-        except (ImportError, ValueError):
+        except (ImportError, ValueError, RuntimeError):
             self.llava = LlavaForConditionalGeneration.from_pretrained(
                 backbone,
                 torch_dtype=th.float16,

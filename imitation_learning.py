@@ -241,7 +241,12 @@ _CAM_X_SLICE = slice(NUM_BINARY, NUM_BINARY + NUM_CAMERA_BINS)
 _CAM_Y_SLICE = slice(NUM_BINARY + NUM_CAMERA_BINS, NUM_BINARY + 2 * NUM_CAMERA_BINS)
 
 
-def vla_loss(logits: th.Tensor, targets: th.Tensor) -> tuple[th.Tensor, float, float]:
+def vla_loss(
+    logits: th.Tensor,
+    targets: th.Tensor,
+    pos_weight: th.Tensor | None = None,
+    cam_weight: th.Tensor | None = None,
+) -> tuple[th.Tensor, float, float]:
     """BCE on binary actions + cross-entropy on each camera axis, averaged over
     the chunk axis when present.
 
@@ -250,6 +255,13 @@ def vla_loss(logits: th.Tensor, targets: th.Tensor) -> tuple[th.Tensor, float, f
         targets: (B, NUM_BINARY + NUM_CAMERA) or (B, N, NUM_BINARY + NUM_CAMERA)
                  last 2 entries are bin indices (stored as float32 for collate
                  uniformity; cast to long here).
+        pos_weight: optional (NUM_BINARY,) BCE positive-class weights. Upweights
+                 rare positives (e.g. movement keys) so the head learns to assert
+                 them instead of collapsing to the ~0 base rate. See
+                 `compute_class_weights`.
+        cam_weight: optional (NUM_CAMERA_BINS,) cross-entropy class weights shared
+                 by both camera axes. Downweights the dominant 0° bin so the head
+                 doesn't collapse onto the majority class.
 
     Returns (total_loss, bce_value, camera_ce_value).
     """
@@ -266,12 +278,86 @@ def vla_loss(logits: th.Tensor, targets: th.Tensor) -> tuple[th.Tensor, float, f
     cam_x_targets = targets[:, NUM_BINARY].long()
     cam_y_targets = targets[:, NUM_BINARY + 1].long()
 
-    bce = nn.functional.binary_cross_entropy_with_logits(binary_logits, binary_targets)
-    ce_x = nn.functional.cross_entropy(cam_x_logits, cam_x_targets)
-    ce_y = nn.functional.cross_entropy(cam_y_logits, cam_y_targets)
+    if pos_weight is not None:
+        pos_weight = pos_weight.to(binary_logits.device, binary_logits.dtype)
+    if cam_weight is not None:
+        cam_weight = cam_weight.to(cam_x_logits.device, cam_x_logits.dtype)
+
+    bce = nn.functional.binary_cross_entropy_with_logits(
+        binary_logits, binary_targets, pos_weight=pos_weight
+    )
+    ce_x = nn.functional.cross_entropy(cam_x_logits, cam_x_targets, weight=cam_weight)
+    ce_y = nn.functional.cross_entropy(cam_y_logits, cam_y_targets, weight=cam_weight)
     cam_ce = 0.5 * (ce_x + ce_y)
 
     return bce + cam_ce, bce.item(), cam_ce.item()
+
+
+def compute_class_weights(
+    targets_by_stem: dict,
+    pos_weight_clip: tuple[float, float] = (0.5, 4.0),
+    cam_weight_clip: tuple[float, float] = (0.3, 5.0),
+) -> tuple[th.Tensor, th.Tensor]:
+    """Derive BCE pos_weight + camera CE class-weights from the demo distribution.
+
+    The contractor demos are heavily imbalanced (attack ~83% on, movement <16%,
+    camera ~90% at the 0° bin), and unweighted BCE/CE collapse the heads onto the
+    marginal. This computes a *sqrt-compressed* inverse-frequency reweighting:
+
+      * pos_weight[i] = sqrt(#neg / #pos) for binary action i, clipped.
+      * cam_weight[b] = sqrt(mean_count / count[b]) over the combined x+y bin
+        histogram, clipped.
+
+    The sqrt + tight clip is deliberate. Full #neg/#pos (clipped 0.05–50) was
+    tried first and over-corrected catastrophically in rollout: rare actions
+    (hotbar, drop) saturated to sigmoid ~0.93 from the 50× upweight while the
+    *most common, most essential* action — attack (the one that breaks blocks) —
+    was suppressed to ~0.05 by the 0.05 lower clip. The agent fired every key at
+    once (forward+back+left+right cancel) and never attacked. sqrt keeps the
+    rebalancing direction but tames the magnitude; the (0.5, 4.0) clip caps
+    residual extremes so no action is forced on or off by the weight alone.
+
+    Returns (pos_weight (NUM_BINARY,), cam_weight (NUM_CAMERA_BINS,)).
+    """
+    bin_pos = np.zeros(NUM_BINARY, dtype=np.float64)
+    n_frames = 0
+    cam_counts = np.zeros(NUM_CAMERA_BINS, dtype=np.float64)
+    for arr in targets_by_stem.values():  # (T, NUM_BINARY + NUM_CAMERA)
+        bin_pos += arr[:, :NUM_BINARY].sum(axis=0)
+        n_frames += arr.shape[0]
+        for axis in (NUM_BINARY, NUM_BINARY + 1):
+            idx = arr[:, axis].astype(np.int64)
+            cam_counts += np.bincount(idx, minlength=NUM_CAMERA_BINS)[:NUM_CAMERA_BINS]
+
+    bin_pos = np.clip(bin_pos, 1.0, None)  # avoid div-by-zero for never-on actions
+    pos_weight = np.sqrt((n_frames - bin_pos) / bin_pos)
+    pos_weight = np.clip(pos_weight, *pos_weight_clip)
+
+    cam_counts = np.clip(cam_counts, 1.0, None)
+    cam_weight = np.sqrt(cam_counts.mean() / cam_counts)
+    cam_weight = np.clip(cam_weight, *cam_weight_clip)
+
+    return (
+        th.tensor(pos_weight, dtype=th.float32),
+        th.tensor(cam_weight, dtype=th.float32),
+    )
+
+
+def apply_history_dropout(pasts: th.Tensor, p: float) -> th.Tensor:
+    """Randomly zero the entire past-action vector for a fraction `p` of samples.
+
+    Movement/camera are highly autocorrelated in the demos, so a model with the
+    past-action feature learns ``P(action | recent actions)`` and at rollout —
+    where the buffer is dominated by "no movement" — suppresses movement below
+    even its base rate (a self-reinforcing no-move attractor). Zeroing the whole
+    history for a fraction of training samples (mimicking the start-of-trajectory
+    zero-padding the model already sees) forces it to read the *frame* instead.
+    No-op when p<=0 or there are no past-action columns.
+    """
+    if p <= 0.0 or pasts.size(-1) == 0:
+        return pasts
+    keep = (th.rand(pasts.size(0), 1, device=pasts.device) >= p).to(pasts.dtype)
+    return pasts * keep
 
 
 def _collate(batch):
@@ -374,6 +460,8 @@ def train_vla(
     chunk_size: int = 1,
     use_language: bool = True,
     restart: bool = False,
+    weighted_loss: bool = False,
+    history_dropout: float = 0.0,
 ):
     """Train the VLA action head and return (model, test_subset, history).
 
@@ -393,6 +481,18 @@ def train_vla(
         f"Dataset: {len(dataset):,} samples  "
         f"(past_action_k={past_action_k}  chunk_size={chunk_size})"
     )
+
+    pos_weight = cam_weight = None
+    if weighted_loss:
+        pos_weight, cam_weight = compute_class_weights(dataset.targets_by_stem)
+        pos_weight = pos_weight.to(device)
+        cam_weight = cam_weight.to(device)
+        print(
+            f"Weighted loss ON — pos_weight[forward]={pos_weight[2]:.1f} "
+            f"pos_weight[attack]={pos_weight[0]:.2f}  cam_weight[0deg]={cam_weight[5]:.2f}"
+        )
+    if history_dropout > 0:
+        print(f"History dropout ON — p={history_dropout}")
 
     test_size = int(len(dataset) * test_split)
     val_size = int(len(dataset) * val_split)
@@ -464,6 +564,8 @@ def train_vla(
                     "lr": lr,
                     "val_split": val_split,
                     "test_split": test_split,
+                    "weighted_loss": weighted_loss,
+                    "history_dropout": history_dropout,
                     "camera_quantizer": {
                         "camera_maxval": DEFAULT_CAMERA_QUANTIZER.camera_maxval,
                         "camera_binsize": DEFAULT_CAMERA_QUANTIZER.camera_binsize,
@@ -491,10 +593,10 @@ def train_vla(
         for idx, (imgs, texts, acts, pasts) in enumerate(train_loader):
             print(f"Training batch {idx + 1}/{len(train_loader)}", end="\r")
             acts = acts.to(device)
-            pasts = pasts.to(device)
+            pasts = apply_history_dropout(pasts.to(device), history_dropout)
             optim.zero_grad()
             logits = model(imgs, texts, pasts)
-            loss, bce_v, cam_v = vla_loss(logits, acts)
+            loss, bce_v, cam_v = vla_loss(logits, acts, pos_weight, cam_weight)
             loss.backward()
             optim.step()
             train_total += loss.item()
@@ -516,7 +618,7 @@ def train_vla(
                 acts = acts.to(device)
                 pasts = pasts.to(device)
                 logits = model(imgs, texts, pasts)
-                loss, bce_v, cam_v = vla_loss(logits, acts)
+                loss, bce_v, cam_v = vla_loss(logits, acts, pos_weight, cam_weight)
                 val_total += loss.item()
                 val_bce += bce_v
                 val_cam += cam_v
@@ -584,6 +686,8 @@ def train_cached_head(
     chunk_size: int = 1,
     hidden_dim: int | None = None,
     restart: bool = False,
+    weighted_loss: bool = False,
+    history_dropout: float = 0.0,
 ):
     """Train an MLP head on precomputed backbone features.
 
@@ -613,6 +717,19 @@ def train_cached_head(
         f"Cached dataset: {len(dataset):,} samples  "
         f"(tag={cache_tag}  past_action_k={past_action_k}  chunk_size={chunk_size})"
     )
+
+    pos_weight = cam_weight = None
+    if weighted_loss:
+        pos_weight, cam_weight = compute_class_weights(dataset.targets_by_stem)
+        pos_weight = pos_weight.to(device)
+        cam_weight = cam_weight.to(device)
+        print(
+            f"Weighted loss ON — pos_weight[forward]={pos_weight[2]:.1f} "
+            f"pos_weight[attack]={pos_weight[0]:.2f}  cam_weight[0deg]={cam_weight[5]:.2f} "
+            f"cam_weight[max]={cam_weight.max():.1f}"
+        )
+    if history_dropout > 0:
+        print(f"History dropout ON — p={history_dropout}")
 
     test_size = int(len(dataset) * test_split)
     val_size = int(len(dataset) * val_split)
@@ -679,6 +796,8 @@ def train_cached_head(
                     "lr": lr,
                     "val_split": val_split,
                     "test_split": test_split,
+                    "weighted_loss": weighted_loss,
+                    "history_dropout": history_dropout,
                     "camera_quantizer": {
                         "camera_maxval": DEFAULT_CAMERA_QUANTIZER.camera_maxval,
                         "camera_binsize": DEFAULT_CAMERA_QUANTIZER.camera_binsize,
@@ -699,10 +818,10 @@ def train_cached_head(
         for feats, acts, pasts in train_loader:
             feats = feats.to(device)
             acts = acts.to(device)
-            pasts = pasts.to(device)
+            pasts = apply_history_dropout(pasts.to(device), history_dropout)
             optim.zero_grad()
             logits = model(feats, pasts)
-            loss, bce_v, cam_v = vla_loss(logits, acts)
+            loss, bce_v, cam_v = vla_loss(logits, acts, pos_weight, cam_weight)
             loss.backward()
             optim.step()
             train_total += loss.item()
@@ -723,7 +842,7 @@ def train_cached_head(
                 acts = acts.to(device)
                 pasts = pasts.to(device)
                 logits = model(feats, pasts)
-                loss, bce_v, cam_v = vla_loss(logits, acts)
+                loss, bce_v, cam_v = vla_loss(logits, acts, pos_weight, cam_weight)
                 val_total += loss.item()
                 val_bce += bce_v
                 val_cam += cam_v
@@ -988,6 +1107,19 @@ if __name__ == "__main__":
         action="store_true",
         help="Run evaluate() on the held-out test split after training",
     )
+    p.add_argument(
+        "--weighted-loss",
+        action="store_true",
+        help="Class-balance the loss: BCE pos_weight on rare binary actions + "
+        "inverse-frequency camera-bin weights (fixes head collapse onto the marginal)",
+    )
+    p.add_argument(
+        "--history-dropout",
+        type=float,
+        default=0.0,
+        help="Probability of zeroing the whole past-action vector per training "
+        "sample (breaks the no-move feedback trap; e.g. 0.5)",
+    )
     a = p.parse_args()
 
     model, test_set, _ = train_vla(
@@ -1005,6 +1137,8 @@ if __name__ == "__main__":
         chunk_size=a.chunk_size,
         use_language=not a.no_language,
         restart=a.restart,
+        weighted_loss=a.weighted_loss,
+        history_dropout=a.history_dropout,
     )
     if a.evaluate_after and len(test_set) > 0:
         evaluate(

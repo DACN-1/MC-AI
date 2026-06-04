@@ -1,6 +1,7 @@
 """Run MineRL rollout episodes with a trained VLAAgent or a random policy."""
 
 import argparse
+import base64
 import json
 import os
 from collections import deque
@@ -12,8 +13,9 @@ import numpy as np
 import torch
 from PIL import Image
 
-from VLAAgent import VLAAgent
+import eval_envs  # noqa: F401 — registers custom 640x360 envs + color matching
 from action_mapping import map_to_minerl_action
+from agent_loader import load_agent as _load_local_agent
 from constants import (
     NUM_OUTPUT_LOGITS,
     PAST_ACTION_DIM,
@@ -22,38 +24,58 @@ from constants import (
 from eval_logger import EpisodeLogger
 
 
-def _load_agent(model_path: str, device: str) -> tuple[VLAAgent, dict]:
-    """Load a VLA checkpoint produced by imitation_learning.train_vla.
+class _RemoteAgent:
+    """Thin client that calls an inference_server.py running on another host.
 
-    Returns (agent, config) — config carries past_action_k / chunk_size /
-    use_language so the rollout loop can match training-time conditioning.
+    Mirrors the in-process agent's call signature —
+    `agent(images, texts, past_actions) -> (1, chunk_size, NUM_OUTPUT_LOGITS)` —
+    but POSTs the frame + past-action vector to a native inference server (e.g.
+    macOS + MPS) and wraps the returned logits back into a tensor. This lets the
+    Docker container run only the MineRL env while the GPU does inference.
     """
-    ckpt = torch.load(model_path, map_location="cpu")
-    if not isinstance(ckpt, dict) or "state_dict" not in ckpt:
-        raise ValueError(
-            f"Checkpoint at {model_path} is not in the expected format "
-            "(missing 'state_dict' key). Expected a dict produced by train_vla()."
+
+    def __init__(self, endpoint: str, chunk_size: int):
+        # endpoint like "host.docker.internal:8765"
+        self._url = f"http://{endpoint}/predict"
+        self._chunk_size = chunk_size
+
+    def __call__(self, images, texts, past_actions=None):
+        import urllib.request
+
+        img = images[0]
+        arr = np.asarray(img, dtype=np.uint8)
+        if past_actions is not None:
+            past = np.asarray(past_actions, dtype=np.float32).reshape(-1).tolist()
+        else:
+            past = []
+        payload = json.dumps(
+            {
+                "pov": base64.b64encode(arr.tobytes()).decode("ascii"),
+                "shape": list(arr.shape),
+                "prompt": texts[0],
+                "past": past,
+            }
+        ).encode("utf-8")
+        req = urllib.request.Request(
+            self._url, data=payload, headers={"Content-Type": "application/json"}
         )
-    backbone = ckpt.get("llava_model", "llava-hf/llava-1.5-7b-hf")
-    cfg = ckpt.get("config", {})
-    past_action_k = cfg.get("past_action_k", 0)
-    chunk_size = cfg.get("chunk_size", 1)
-    use_language = cfg.get("use_language", True)
-    agent = VLAAgent(
-        output_dim=NUM_OUTPUT_LOGITS,
-        backbone=backbone,
-        use_language=use_language,
-        past_action_dim=past_action_k * PAST_ACTION_DIM,
-        chunk_size=chunk_size,
-    )
-    agent.action_head.load_state_dict(ckpt["state_dict"])
-    agent = agent.to(device)
-    agent.eval()
-    return agent, {
-        "past_action_k": past_action_k,
-        "chunk_size": chunk_size,
-        "use_language": use_language,
-    }
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            out = json.loads(resp.read().decode("utf-8"))
+        # Server returns (chunk_size, NUM_OUTPUT_LOGITS); add the batch axis.
+        return torch.tensor(out["logits"], dtype=torch.float32).unsqueeze(0)
+
+
+def _remote_config(endpoint: str) -> dict:
+    """Fetch past_action_k / chunk_size / use_language from the server."""
+    import urllib.request
+
+    with urllib.request.urlopen(f"http://{endpoint}/config", timeout=30) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def _load_agent(model_path: str, device: str):
+    """Local load — delegates to the gym-free agent_loader."""
+    return _load_local_agent(model_path, device)
 
 
 def _obs_to_pil(obs: dict) -> Image.Image:
@@ -100,18 +122,29 @@ def run(args: argparse.Namespace) -> None:
     logger = EpisodeLogger(output_dir=args.output_dir)
 
     device = _resolve_device(args.device)
-    if args.model_path:
+    if args.remote_agent:
+        agent_cfg = _remote_config(args.remote_agent)
+        agent = _RemoteAgent(args.remote_agent, agent_cfg["chunk_size"])
+    elif args.model_path:
         agent, agent_cfg = _load_agent(args.model_path, device)
     else:
         agent, agent_cfg = None, {"past_action_k": 0, "chunk_size": 1, "use_language": True}
     past_action_k = agent_cfg["past_action_k"]
 
     env = gym.make(args.env)
+    env, color_applied = eval_envs.maybe_wrap_color(env, args.env, args.color_match)
     # Captured once: gives us the canonical key set including pickItem/swapHands,
     # which the model doesn't predict. We merge it under predicted actions per step.
     no_op_template = env.action_space.no_op()
     print(f"Environment: {args.env}")
-    print(f"Policy: {'VLAAgent on ' + device + ' from ' + args.model_path if agent else 'random'}")
+    print(f"Color match: {'on (' + args.env + ' LAB target)' if color_applied else 'off'}")
+    if agent is None:
+        policy_desc = "random"
+    elif args.remote_agent:
+        policy_desc = f"remote inference server @ {args.remote_agent}"
+    else:
+        policy_desc = f"{type(agent).__name__} on {device} from {args.model_path}"
+    print(f"Policy: {policy_desc}")
     print(f"Episodes: {args.episodes}   Max steps: {args.max_steps}")
     print()
 
@@ -151,7 +184,12 @@ def run(args: argparse.Namespace) -> None:
                     # only the first predicted step and replan next tick.
                     chunk_logits = agent([img], [args.prompt], past_tensor)
                     logits = chunk_logits[0, 0]
-                minerl_action = map_to_minerl_action(logits, base_action=no_op_template)
+                minerl_action = map_to_minerl_action(
+                    logits,
+                    base_action=no_op_template,
+                    sample=args.sample,
+                    temperature=args.temperature,
+                )
                 action_vec = logits.detach().cpu().tolist()
                 if past_action_k > 0:
                     past_buffer.append(action_to_onehot(minerl_action))
@@ -217,7 +255,27 @@ def run(args: argparse.Namespace) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run MineRL rollout episodes.")
     parser.add_argument("--model-path", default=None, help="Path to VLAAgent checkpoint (.pt)")
+    parser.add_argument(
+        "--remote-agent",
+        default=None,
+        metavar="HOST:PORT",
+        help="Run inference on a remote inference_server.py (e.g. "
+        "host.docker.internal:8765) instead of loading the model in-process. "
+        "Lets the container run only the MineRL env while a native host (e.g. "
+        "macOS + MPS) does the model forward.",
+    )
     parser.add_argument("--env", default="MineRLBasaltFindCave-v0", help="MineRL environment ID")
+    parser.add_argument(
+        "--color-match",
+        choices=("auto", "on", "lab", "off"),
+        default="auto",
+        help="Correct the POV channel order to the training distribution. The "
+        "training videos have R/B swapped (cv2 save bug), so the model needs an "
+        "R↔B swap at eval. 'auto' swaps iff the env id is a known custom env "
+        "(default); 'on' requires one; 'lab' additionally applies a per-task "
+        "Reinhard LAB transfer (opt-in, usually unnecessary); 'off' disables. "
+        "Affects model input and recorded video.",
+    )
     parser.add_argument("--episodes", type=int, default=10)
     parser.add_argument("--max-steps", type=int, default=500)
     parser.add_argument("--output-dir", default="./rollout_logs")
@@ -231,6 +289,19 @@ def main() -> None:
         "--prompt",
         default="Play Minecraft.",
         help="Text prompt fed to the VLA backbone each step",
+    )
+    parser.add_argument(
+        "--sample",
+        action="store_true",
+        help="Stochastic decode: Bernoulli-sample binaries + softmax-sample camera "
+        "instead of threshold/argmax. Breaks the greedy no-move collapse (see "
+        "no_move_fix.md); pair with a class-balanced-trained head.",
+    )
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=1.0,
+        help="Decode temperature for --sample (>1 flattens, <1 sharpens).",
     )
     args = parser.parse_args()
     run(args)

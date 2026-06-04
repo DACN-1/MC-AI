@@ -47,9 +47,16 @@ from imitation_learning import (
 )
 
 
-def _cache_tag(backbone: str, task_filter: str | None, use_language: bool) -> str:
+def _cache_tag(
+    backbone: str, task_filter: str | None, use_language: bool, frame_stride: int = 1
+) -> str:
     task_part = task_filter if task_filter else "combined"
-    return f"{backbone}_{task_part}_{'lang' if use_language else 'nolang'}"
+    tag = f"{backbone}_{task_part}_{'lang' if use_language else 'nolang'}"
+    # Mirror feature_cache.precompute's convention: a strided cache gets its own
+    # tag so it never collides with (or resume-mismatches against) a full cache.
+    if frame_stride > 1:
+        tag += f"_stride{frame_stride}"
+    return tag
 
 
 def _ensure_cache(
@@ -61,6 +68,7 @@ def _ensure_cache(
     llava_id: str,
     cache_batch_size: int,
     device: str,
+    frame_stride: int = 1,
 ) -> str:
     """Build (or resume) the feature cache, returning the tag.
 
@@ -73,7 +81,7 @@ def _ensure_cache(
     import json as _json
     from feature_cache import precompute  # lazy import — only needed for cached path
 
-    tag = _cache_tag(backbone, task_filter, use_language)
+    tag = _cache_tag(backbone, task_filter, use_language, frame_stride)
     cache_npy = cache_dir / f"{tag}.npy"
     cache_meta = cache_dir / f"{tag}.json"
     progress_path = cache_dir / f"{tag}.progress"
@@ -109,6 +117,7 @@ def _ensure_cache(
         batch_size=cache_batch_size,
         device=device,
         tag=tag,
+        frame_stride=frame_stride,
     )
     return tag
 
@@ -163,9 +172,31 @@ def main():
         help="Future actions predicted per forward (1 = off)",
     )
     parser.add_argument(
+        "--frame-stride",
+        type=int,
+        default=1,
+        help="Cache every Nth frame per trajectory (N>1 cuts backbone cost ~N-fold; "
+        "targets/past-actions stay full-resolution, rollout unchanged). The cache "
+        "tag gets a _stride<N> suffix so it never collides with a full cache.",
+    )
+    parser.add_argument(
         "--no-language",
         action="store_true",
         help="Zero the text prompt (language-pathway ablation cell)",
+    )
+    parser.add_argument(
+        "--weighted-loss",
+        action="store_true",
+        help="Class-balance the BC loss (pos_weight + camera-bin inverse-freq) to "
+        "counter the demo imbalance that collapses heads to the marginal — see "
+        "no_move_fix.md.",
+    )
+    parser.add_argument(
+        "--history-dropout",
+        type=float,
+        default=0.0,
+        help="Probability of zeroing the whole past-action vector per sample during "
+        "training; breaks the no-move past-action feedback trap.",
     )
     parser.add_argument(
         "--end-to-end",
@@ -265,6 +296,7 @@ def main():
             llava_id=args.llava_model,
             cache_batch_size=args.cache_batch_size,
             device=args.device,
+            frame_stride=args.frame_stride,
         )
 
         if not args.skip_train:
@@ -284,6 +316,8 @@ def main():
                 past_action_k=args.past_action_k,
                 chunk_size=args.chunk_size,
                 restart=args.restart,
+                weighted_loss=args.weighted_loss,
+                history_dropout=args.history_dropout,
             )
         else:
             from feature_cache import CachedFeatureDataset, HeadOnlyAgent

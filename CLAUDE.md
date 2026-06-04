@@ -167,6 +167,33 @@ train_cached_head(
 One cache pass costs ~26 h per LLaVA tag / ~6 h per CLIP tag on A5000; all 8
 head-training runs together fit in a few hours. See "Compute budget" below.
 
+### 2c. Cache build on a rented RTX 5090 (Blackwell / sm_120)
+
+Renting a 5090 on vast.ai is the cheapest way to run the cache build (best
+DLP/$). Blackwell needs a *different* stack than the cluster, so there are two
+install paths — pick by hardware:
+
+- **A5000 cluster** — `requirements.txt` (torch 2.4 + the pinned FlashAttention-2
+  wheel). Unchanged; FA2 enables batch=64 cache builds on 24 GB.
+- **RTX 5090 / Blackwell** — `requirements-blackwell.txt` + torch 2.7 from the
+  cu128 index. **No flash-attn** (stock FA2 has no sm_120 kernel); `VLAAgent`
+  falls back to sdpa, numerically equivalent modulo fp16 reduction order. fp16
+  is kept (not bf16) so 5090-built caches stay mergeable with A5000 caches.
+
+```bash
+# On the rented box (idempotent): venv + cu128 torch + deps + verify.
+bash scripts/setup_vastai_5090.sh
+
+# ALWAYS probe throughput before committing a multi-day rental — it prints
+# samples/sec and an extrapolated full-run $ cost from real numbers.
+python scripts/probe_5090_throughput.py --data-dir ./trajectories \
+    --backbone llava --use-language --batch-size 24 --price 0.686
+```
+
+Without FA2, sdpa uses more attention-activation memory, so the 5090's 32 GB
+does *not* buy the A5000's headroom. Start `cache_batch_size`/`--batch-size` at
+**24**; bisect up (28/32) if `nvidia-smi` shows room, down (16) on OOM.
+
 ### 3. Roll out a trained agent in MineRL
 ```bash
 python run_rollout.py \
@@ -286,9 +313,11 @@ and head output is `NUM_OUTPUT_LOGITS * chunk_size`. Pre-temporal checkpoints
 
 ## Dependencies
 
-Pinned in `requirements.txt` for LMU CIP Abaki (Python 3.11, torch 2.1.0,
-transformers <4.45). MineRL v1.0 + gym 0.23.1 are required for the rollout
-path; everything else only needs the ML stack + `decord` for frame decoding.
+Pinned in `requirements.txt` for LMU CIP Abaki (Python 3.12, torch 2.2–2.4 +
+cu121/123, transformers 4.45–4.49). For RTX 5090 / Blackwell (sm_120) use
+`requirements-blackwell.txt` + torch 2.7 from the cu128 index instead — see
+workflow 2c. MineRL v1.0 + gym 0.23.1 are required for the rollout path;
+everything else only needs the ML stack + `decord` for frame decoding.
 
 ## Resumability
 

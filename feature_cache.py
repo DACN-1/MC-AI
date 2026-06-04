@@ -55,7 +55,7 @@ def _iter_trajectory_dirs(root: Path, task_filter: str | None):
 
 
 def enumerate_samples(
-    data_root: str | Path, task_filter: str | None = None
+    data_root: str | Path, task_filter: str | None = None, frame_stride: int = 1
 ) -> list[tuple[str, int, str, str]]:
     """Return (mp4_path, frame_idx, task_text, stem) tuples in cache-order.
 
@@ -63,7 +63,15 @@ def enumerate_samples(
     cache writes and reads agree on indexing. Logs a per-task-dir breakdown and
     raises if any directory contributes zero samples — silent partial loads
     previously wasted an entire training run.
+
+    `frame_stride > 1` keeps only every Nth frame per trajectory (0, N, 2N, ...),
+    cutting the cached-feature count — and thus frozen-backbone compute — ~N-fold.
+    CachedFeatureDataset still reconstructs targets and past-actions at full
+    resolution from all_actions.json, so this thins only the *training* frames:
+    the policy and `run_rollout.py` stay at native rate (no action-repeat needed).
     """
+    if frame_stride < 1:
+        raise ValueError(f"frame_stride must be >= 1, got {frame_stride}")
     root = Path(data_root)
     samples: list[tuple[str, int, str, str]] = []
     per_dir_counts: dict[str, int] = {}
@@ -91,7 +99,7 @@ def enumerate_samples(
                 continue
             task_text = all_infos.get(stem, {}).get("text_prompt", "play minecraft")
             actions = all_actions[stem]
-            for idx in range(len(actions)):
+            for idx in range(0, len(actions), frame_stride):
                 samples.append((str(mp4_file), idx, task_text, stem))
                 dir_n += 1
         per_dir_counts[traj_dir.name] = dir_n
@@ -190,6 +198,7 @@ def precompute(
     batch_size: int = 16,
     device: str = "cuda" if th.cuda.is_available() else "cpu",
     tag: str | None = None,
+    frame_stride: int = 1,
     progress_interval: int = 100,
 ) -> Path:
     """Compute and write a feature cache. Returns the .npy path.
@@ -203,7 +212,7 @@ def precompute(
     """
     cache_dir = Path(cache_dir)
     cache_dir.mkdir(parents=True, exist_ok=True)
-    samples = enumerate_samples(data_root, task_filter=task_filter)
+    samples = enumerate_samples(data_root, task_filter=task_filter, frame_stride=frame_stride)
     if not samples:
         raise RuntimeError(f"No samples found under {data_root} (filter={task_filter!r})")
 
@@ -211,6 +220,8 @@ def precompute(
         task_part = (task_filter or "all").replace("/", "_")
         lang_part = "lang" if use_language else "nolang"
         tag = f"{backbone}_{task_part}_{lang_part}"
+        if frame_stride > 1:
+            tag += f"_stride{frame_stride}"
     cache_path = cache_dir / f"{tag}.npy"
     meta_path = cache_dir / f"{tag}.json"
     progress_path = cache_dir / f"{tag}.progress"
@@ -249,6 +260,7 @@ def precompute(
             and meta_existing.get("use_language") == use_language
             and meta_existing.get("task_filter") == task_filter
             and meta_existing.get("llava_id") == expected_llava_id
+            and meta_existing.get("frame_stride", 1) == frame_stride
         )
         if matches:
             start_batch = _read_progress(progress_path)
@@ -271,6 +283,7 @@ def precompute(
             "llava_id": llava_id if backbone == "llava" else None,
             "use_language": use_language,
             "task_filter": task_filter,
+            "frame_stride": frame_stride,
             "n_samples": len(samples),
             "feature_dim": feature_dim,
             "dtype": "float16",
@@ -498,6 +511,13 @@ def main():
         default="cuda" if th.cuda.is_available() else "cpu",
     )
     p.add_argument("--tag", default=None, help="Override the default cache tag")
+    p.add_argument(
+        "--frame-stride",
+        type=int,
+        default=1,
+        help="Cache every Nth frame per trajectory (N>1 cuts cost ~N-fold; "
+        "targets/past-actions stay full-resolution, rollout unchanged)",
+    )
     args = p.parse_args()
 
     precompute(
@@ -510,6 +530,7 @@ def main():
         batch_size=args.batch_size,
         device=args.device,
         tag=args.tag,
+        frame_stride=args.frame_stride,
     )
 
 

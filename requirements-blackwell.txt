@@ -1,0 +1,50 @@
+# VLA Action Head Requirements — NVIDIA RTX 5090 / Blackwell (sm_120) path.
+#
+# This is the *additive* sibling of requirements.txt. The cluster (RTX A5000,
+# Ada/Ampere) keeps using requirements.txt unchanged — torch 2.4 + the pinned
+# FlashAttention-2 wheel. Blackwell (sm_120) has no kernel image in those
+# wheels, so the rented vast.ai 5090 box uses *this* file instead.
+#
+# Two deliberate differences from requirements.txt:
+#   1. torch/torchvision/torchaudio are NOT listed here — they cannot resolve
+#      from normal PyPI for Blackwell. Install them FIRST from the cu128 index:
+#        pip install torch==2.7.* torchvision torchaudio \
+#            --index-url https://download.pytorch.org/whl/cu128
+#      (torch 2.7.0 is the first stable release shipping cu128 / sm_120 wheels.)
+#      scripts/setup_vastai_5090.sh does this for you, then `pip install -r` here.
+#   2. flash-attn is intentionally OMITTED. Stock flash-attn has no sm_120
+#      kernel ("no kernel image available"), and there is no official prebuilt
+#      wheel for cu128 + torch2.7 + cp312. VLAAgent already falls back to sdpa
+#      attention when flash_attn is absent — numerically equivalent modulo fp16
+#      reduction order. Do not `pip install flash-attn` on this box.
+#
+# fp16 is kept everywhere (NOT bf16): the feature cache is stored as np.float16,
+# so caches built on the 5090 stay numerically mergeable with A5000-built caches
+# for the combined-dataset ablation. Do not switch the backbone to bf16.
+#
+# Python 3.12 (cp312) is required — same as requirements.txt — because numpy<2
+# and the rest of the stack were validated there. Use a 3.12 venv or a 3.12
+# base image (e.g. pytorch/pytorch:2.7.0-cuda12.8-cudnn9-runtime).
+
+# --- torch installed separately from cu128 index (see header) — NOT pinned here ---
+
+# Computer vision and image processing
+opencv-python>=4.5.0
+Pillow>=9.0.0
+
+# Transformers and LLaVA (4.45+ for the tokenizer.json format; <4.50 keeps the
+# attn_implementation / device_map loading API that VLAAgent relies on)
+transformers>=4.45.0,<4.50.0
+accelerate>=0.30.0
+sentencepiece>=0.1.97
+
+# Data processing and utilities
+numpy>=1.26.0,<2.0   # 1.26 is the first numpy with Python 3.12 wheels
+tqdm>=4.64.0
+scikit-learn>=1.1.0
+matplotlib>=3.5.0
+decord>=0.6.0  # MP4 random-access frame decoding for TrajectoryDataset
+seaborn>=0.11.0
+coloredlogs>=15.0
+
+# MineRL / gym are *not* installed here — rollout-only, Docker-only (see Dockerfile).

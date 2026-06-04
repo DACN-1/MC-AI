@@ -1,7 +1,11 @@
 #!/bin/bash
 #SBATCH --job-name=vla_train
 #SBATCH --partition=Abaki
-#SBATCH --qos=abaki
+# QOS: the `abaki` QOS is no longer in the stud_ifi association (submitting with
+# it fails "Invalid qos specification"). `normal` is accepted by the Abaki
+# partition and starts immediately on a free node. Override with QOS=... if your
+# association regains a dedicated QOS.
+#SBATCH --qos=normal
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=8
@@ -58,9 +62,16 @@ CACHE_BATCH_SIZE="${CACHE_BATCH_SIZE:-$CACHE_BATCH_SIZE_DEFAULT}"
 LR="${LR:-1e-3}"
 PAST_ACTION_K="${PAST_ACTION_K:-8}"
 CHUNK_SIZE="${CHUNK_SIZE:-8}"
+# FRAME_STRIDE>1 caches every Nth frame (cuts the one-time backbone build
+# ~N-fold). Targets/past-actions stay full-resolution; rollout is unchanged.
+# Used for fast N=4 validation cells; leave at 1 for the real ablation caches.
+FRAME_STRIDE="${FRAME_STRIDE:-1}"
 
 LANG_TAG=$([ "$USE_LANGUAGE" = "1" ] && echo lang || echo nolang)
 TASK_TAG=${TASK_FILTER:-combined}
+# Keep strided caches/outputs in their own namespace so they never overwrite
+# (or get confused with) a full-resolution cell.
+STRIDE_TAG=$([ "$FRAME_STRIDE" -gt 1 ] && echo "_stride${FRAME_STRIDE}" || echo "")
 
 # ---------- storage layout --------------------------------------------------
 # /var/tmp1 is the local NVMe on Abaki nodes (1 TB on 1N, 2 TB on 2N).
@@ -72,7 +83,7 @@ mkdir -p "$NODE_SCRATCH"
 DATA_TARBALL_DIR="$REPO_ROOT/trajectories"            # persistent tarballs
 DATA_DIR="$NODE_SCRATCH/trajectories"                 # extracted, per node
 CACHE_DIR="$NODE_SCRATCH/caches"                      # survives across jobs
-OUTPUT_DIR="$REPO_ROOT/output/${BACKBONE}_${TASK_TAG}_${LANG_TAG}"
+OUTPUT_DIR="$REPO_ROOT/output/${BACKBONE}_${TASK_TAG}_${LANG_TAG}${STRIDE_TAG}"
 
 export HF_HOME="$NODE_SCRATCH/hf_cache"
 export TRANSFORMERS_CACHE="$HF_HOME/transformers"
@@ -203,6 +214,7 @@ python cluster_pipeline.py \
     --epochs "$EPOCHS" \
     --batch-size "$BATCH_SIZE" \
     --cache-batch-size "$CACHE_BATCH_SIZE" \
+    --frame-stride "$FRAME_STRIDE" \
     --lr "$LR" \
     --device cuda \
     --num-workers 8 \
