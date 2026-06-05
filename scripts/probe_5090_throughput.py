@@ -40,7 +40,9 @@ DEFAULT_FULL_SAMPLES = 6_240_000
 
 # Expected pooled feature dim per backbone — a mismatch here means a cache built
 # now would be rejected by feature_cache resume-validation when merged later.
-EXPECTED_FEATURE_DIM = {"llava": 4096, "clip": 1536}
+# LLaVA: 2 * hidden_size (split image/text pooling per Phase C step 2).
+# CLIP:  2 * projection_dim (image_proj || text_proj).
+EXPECTED_FEATURE_DIM = {"llava": 8192, "clip": 1536}
 
 
 def main() -> None:

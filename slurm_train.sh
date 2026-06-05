@@ -66,6 +66,11 @@ CHUNK_SIZE="${CHUNK_SIZE:-8}"
 # ~N-fold). Targets/past-actions stay full-resolution; rollout is unchanged.
 # Used for fast N=4 validation cells; leave at 1 for the real ablation caches.
 FRAME_STRIDE="${FRAME_STRIDE:-1}"
+# Pin a single head hidden width across all 4 ablation cells so the head-
+# capacity asymmetry between CLIP (feature_dim=1536) and LLaVA (feature_dim=
+# 8192 after split-pool) doesn't confound the backbone comparison — see
+# docs/alignment_handoff.md Phase C Step 1.
+HIDDEN_DIM="${HIDDEN_DIM:-2048}"
 
 LANG_TAG=$([ "$USE_LANGUAGE" = "1" ] && echo lang || echo nolang)
 TASK_TAG=${TASK_FILTER:-combined}
@@ -211,6 +216,7 @@ python cluster_pipeline.py \
     --backbone "$BACKBONE" \
     --past-action-k "$PAST_ACTION_K" \
     --chunk-size "$CHUNK_SIZE" \
+    --hidden-dim "$HIDDEN_DIM" \
     --epochs "$EPOCHS" \
     --batch-size "$BATCH_SIZE" \
     --cache-batch-size "$CACHE_BATCH_SIZE" \

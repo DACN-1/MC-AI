@@ -23,6 +23,7 @@ class VLAAgent(nn.Module):
         use_language: bool = True,
         past_action_dim: int = 0,
         chunk_size: int = 1,
+        head_hidden_dim: int | None = None,
     ):
         super().__init__()
         self.processor = LlavaProcessor.from_pretrained(backbone)
@@ -72,29 +73,61 @@ class VLAAgent(nn.Module):
         self.chunk_size = chunk_size
         self.output_dim = output_dim
 
+        # Split image/text pooling — see encode() docstring. Pooled features are
+        # [image_pool || text_pool] of dim 2*hidden = 8192 for LLaVA-1.5-7B. Mirrors
+        # frozen_vision_baseline.CLIP's [image_proj || text_proj] convention so the
+        # 2×2 ablation's "language vs no-language" cells compare apples to apples.
+        self._llava_hidden = hidden
+        self._feature_dim = 2 * hidden
+        self._head_hidden_dim = (
+            head_hidden_dim if head_hidden_dim is not None else self._feature_dim
+        )
+
         # Action head stays in fp32 — keeps optimizer steps numerically stable
         # regardless of where the (frozen) backbone runs. We cast pooled features
         # to fp32 in forward().
         self.action_head = nn.Sequential(
-            nn.Linear(hidden + past_action_dim, hidden),
+            nn.Linear(self._feature_dim + past_action_dim, self._head_hidden_dim),
             nn.ReLU(),
-            nn.Linear(hidden, output_dim * chunk_size),
+            nn.Linear(self._head_hidden_dim, output_dim * chunk_size),
         )
 
     @property
     def feature_dim(self) -> int:
-        """Width of the pooled LLaVA feature consumed by the head (pre past-action)."""
-        return self.action_head[0].in_features - self.past_action_dim
+        """Width of the pooled LLaVA feature consumed by the head (pre past-action).
+
+        After the split-image/text pooling fix (`docs/alignment_handoff.md`
+        Phase C step 2) this is 2 * llava_hidden_size = 8192 for LLaVA-1.5-7B.
+        """
+        return self._feature_dim
 
     def encode(self, images, texts) -> th.Tensor:
-        """Run the frozen backbone and return pooled (B, feature_dim) features.
+        """Run the frozen backbone and return pooled (B, 2*hidden) features.
 
-        Exposed for the feature-caching pipeline so a separate script can
-        precompute LLaVA embeddings once and reuse them across many head-only
-        training runs.
+        The pooled feature is ``[image_pool || text_pool]`` — image tokens and
+        text tokens of the post-norm hidden state are mean-pooled separately,
+        then concatenated. Mirrors CLIP's ``[image_proj || text_proj]``
+        convention so the 2x2 ablation's no-language cells (Exp 3, Exp 4)
+        compare apples to apples.
+
+        Before this change, the entire (image + text) sequence was mean-pooled
+        into one 4096-d vector. Because the LlavaProcessor emits a single
+        ``<image>`` placeholder per image which the model expands to
+        ``image_seq_length`` (=576) tokens at forward time, the joint mean
+        was dominated by image tokens (~576) versus a handful of text tokens
+        (~5), washing out the language signal entirely. See
+        ``docs/alignment_handoff.md`` for the full diagnostic.
+
+        ``use_language=False`` zeros ``text_pool`` after pooling — matching
+        ``frozen_vision_baseline.py``'s zero-text-features behavior. We do NOT
+        replace the input text with ``""``; the encoder still sees the prompt
+        (image tokens attend to text tokens at every layer — that's a LLaVA
+        architectural property that can't be closed by code), but the head
+        input is image-only.
         """
-        effective_texts = texts if self.use_language else [""] * len(texts)
-        prompts = [t if "<image>" in t else f"<image>\n{t}" for t in effective_texts]
+        # Always pass the actual text. use_language is enforced at pooling time,
+        # not at processor time — see docstring.
+        prompts = [t if "<image>" in t else f"<image>\n{t}" for t in texts]
 
         inputs = self.processor(
             images=images,
@@ -125,11 +158,64 @@ class VLAAgent(nn.Module):
         finally:
             handle.remove()
 
-        # LLaMA has no CLS token — mean-pool the last hidden state across the full
-        # (image + text) sequence so the head sees both modalities.
-        pooled = captured["h"].mean(dim=1)
+        image_pool, text_pool = self._split_pool(
+            captured["h"], inputs.input_ids, inputs.attention_mask
+        )
+        if not self.use_language:
+            text_pool = th.zeros_like(text_pool)
+        pooled = th.cat([image_pool, text_pool], dim=-1)
         head_dtype = self.action_head[0].weight.dtype
         return pooled.to(head_dtype)
+
+    def _split_pool(self, h: th.Tensor, input_ids: th.Tensor, attention_mask: th.Tensor):
+        """Mean-pool image-role and text-role tokens of the post-norm hidden state.
+
+        ``h`` is the (B, T_out, hidden) tensor captured by the RMSNorm hook.
+        ``input_ids`` (B, T_in) carries one image-token placeholder per sample
+        which the model expands to ``N`` image tokens during forward, so
+        ``T_out = T_in - 1 + N`` (single image per sample). The image tokens
+        occupy positions ``[img_pos, img_pos + N)`` of the post-expansion
+        sequence; everything else is text or pad.
+
+        Returns ``(image_pool, text_pool)`` both shape ``(B, hidden)``.
+        """
+        B, T_in = input_ids.shape
+        T_out = h.shape[1]
+        if T_out < T_in:
+            raise ValueError(
+                f"hidden state seq_len {T_out} < input_ids seq_len {T_in} — "
+                "expected the model to expand <image> at forward time"
+            )
+        n_per_img = T_out - T_in + 1  # assumes exactly one image placeholder per sample
+
+        image_token_id = self.llava.config.image_token_index
+        img_match = input_ids == image_token_id
+        if not img_match.any(dim=1).all():
+            raise ValueError(
+                f"some samples lack image_token_id={image_token_id} in input_ids"
+            )
+        img_pos = img_match.int().argmax(dim=1)  # (B,) first occurrence per sample
+
+        device = h.device
+        positions = th.arange(T_out, device=device).unsqueeze(0)  # (1, T_out)
+        img_start = img_pos.unsqueeze(1)                          # (B, 1)
+        img_end = img_start + n_per_img                           # (B, 1)
+        is_image = (positions >= img_start) & (positions < img_end)  # (B, T_out)
+
+        # Map post-expansion positions back to pre-expansion positions so we can
+        # look up the original attention mask (pads etc.).
+        pre_pos = th.where(positions >= img_end, positions - (n_per_img - 1), positions)
+        pre_pos = pre_pos.clamp(min=0, max=T_in - 1).long()
+        attn_at_pre = th.gather(attention_mask, 1, pre_pos)  # (B, T_out)
+        is_text = (attn_at_pre > 0) & (~is_image)
+
+        def _masked_mean(values: th.Tensor, mask: th.Tensor) -> th.Tensor:
+            m = mask.unsqueeze(-1).to(values.dtype)
+            s = (values * m).sum(dim=1)
+            c = m.sum(dim=1).clamp(min=1)
+            return s / c
+
+        return _masked_mean(h, is_image), _masked_mean(h, is_text)
 
     def forward(self, images, texts, past_actions=None):
         """Run a forward pass.

@@ -51,7 +51,9 @@ def _load_cached_head_agent(ckpt: dict, cfg: dict, device: str):
     hidden_dim = cfg.get("hidden_dim")
     # cache tags are "<backbone>_<task>_<lang|nolang>"; backbone is the prefix
     # and the language flag is the suffix (the backbone encode() needs it).
-    is_clip = cache_tag.startswith("clip") or feature_dim < 4096
+    # Falling back on feature_dim < 2048 catches CLIP-only (=1536) without
+    # confusing LLaVA-pre-Phase-C (=4096) and LLaVA-post-Phase-C (=8192) caches.
+    is_clip = cache_tag.startswith("clip") or feature_dim < 2048
     use_language = not cache_tag.endswith("nolang")
 
     if is_clip:

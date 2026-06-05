@@ -172,6 +172,16 @@ def main():
         help="Future actions predicted per forward (1 = off)",
     )
     parser.add_argument(
+        "--hidden-dim",
+        type=int,
+        default=None,
+        help="Hidden width of the cached head's MLP. Default None lets "
+        "HeadOnlyAgent fall back to feature_dim (the legacy 1x compression). "
+        "Pin to a constant (e.g. 2048) across all 4 ablation cells to remove the "
+        "head-capacity asymmetry between CLIP (1536) and LLaVA (8192 after split "
+        "pooling) — see docs/alignment_handoff.md Phase C Step 1.",
+    )
+    parser.add_argument(
         "--frame-stride",
         type=int,
         default=1,
@@ -315,6 +325,7 @@ def main():
                 num_workers=args.num_workers,
                 past_action_k=args.past_action_k,
                 chunk_size=args.chunk_size,
+                hidden_dim=args.hidden_dim,
                 restart=args.restart,
                 weighted_loss=args.weighted_loss,
                 history_dropout=args.history_dropout,
