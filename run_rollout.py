@@ -14,7 +14,7 @@ import torch
 from PIL import Image
 
 import eval_envs  # noqa: F401 — registers custom 640x360 envs + color matching
-from action_mapping import map_to_minerl_action
+from action_mapping import build_per_action_vector, map_to_minerl_action
 from agent_loader import load_agent as _load_local_agent
 from constants import (
     NUM_OUTPUT_LOGITS,
@@ -32,35 +32,74 @@ class _RemoteAgent:
     but POSTs the frame + past-action vector to a native inference server (e.g.
     macOS + MPS) and wraps the returned logits back into a tensor. This lets the
     Docker container run only the MineRL env while the GPU does inference.
+
+    Uses a persistent http.client.HTTPConnection so the underlying TCP
+    connection (and any SSH-tunneled session over a high-latency link) is
+    reused across all steps. Opening a new connection per /predict call adds
+    ~1.5 s of TCP+SSH handshake overhead per step over a remote tunnel — that
+    overhead dominated wall-clock time at 5000 steps. With keep-alive, only
+    the first request pays it.
     """
 
     def __init__(self, endpoint: str, chunk_size: int):
         # endpoint like "host.docker.internal:8765"
-        self._url = f"http://{endpoint}/predict"
+        host, _, port = endpoint.partition(":")
+        self._host = host
+        self._port = int(port) if port else 80
         self._chunk_size = chunk_size
+        self._conn = None  # opened lazily on first call
+
+    def _get_conn(self):
+        import http.client
+
+        if self._conn is None:
+            self._conn = http.client.HTTPConnection(self._host, self._port, timeout=120)
+        return self._conn
 
     def __call__(self, images, texts, past_actions=None):
-        import urllib.request
+        import http.client
+        import io
 
         img = images[0]
-        arr = np.asarray(img, dtype=np.uint8)
         if past_actions is not None:
             past = np.asarray(past_actions, dtype=np.float32).reshape(-1).tolist()
         else:
             past = []
+        # JPEG-compress the 640x360 frame (~5-15 kB on real Minecraft frames,
+        # vs ~922 kB raw base64). The server prefers `pov_jpeg` over `pov`;
+        # the raw `pov` + `shape` path is kept for backward compat.
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=90)
         payload = json.dumps(
             {
-                "pov": base64.b64encode(arr.tobytes()).decode("ascii"),
-                "shape": list(arr.shape),
+                "pov_jpeg": base64.b64encode(buf.getvalue()).decode("ascii"),
                 "prompt": texts[0],
                 "past": past,
             }
         ).encode("utf-8")
-        req = urllib.request.Request(
-            self._url, data=payload, headers={"Content-Type": "application/json"}
-        )
-        with urllib.request.urlopen(req, timeout=120) as resp:
-            out = json.loads(resp.read().decode("utf-8"))
+        headers = {"Content-Type": "application/json", "Connection": "keep-alive"}
+
+        # Retry once on dropped connection (server restart, idle timeout, etc.).
+        for attempt in (1, 2):
+            try:
+                conn = self._get_conn()
+                conn.request("POST", "/predict", body=payload, headers=headers)
+                resp = conn.getresponse()
+                data = resp.read()
+                if resp.status != 200:
+                    raise http.client.HTTPException(f"status {resp.status}: {data[:200]!r}")
+                out = json.loads(data.decode("utf-8"))
+                break
+            except (http.client.HTTPException, ConnectionError, OSError):
+                if self._conn is not None:
+                    try:
+                        self._conn.close()
+                    except Exception:
+                        pass
+                    self._conn = None
+                if attempt == 2:
+                    raise
+
         # Server returns (chunk_size, NUM_OUTPUT_LOGITS); add the batch axis.
         return torch.tensor(out["logits"], dtype=torch.float32).unsqueeze(0)
 
@@ -117,6 +156,23 @@ def _resolve_device(requested: str) -> str:
     return requested
 
 
+def _parse_kv_overrides(items: list[str] | None) -> dict[str, float]:
+    """Parse a list of ``key=value`` strings into a {key: float} dict.
+
+    Used by the per-binary-action calibration flags (--binary-temperatures,
+    --binary-thresholds, --binary-logit-bias). Empty list / None returns {}.
+    """
+    out: dict[str, float] = {}
+    for item in items or []:
+        if "=" not in item:
+            raise ValueError(
+                f"expected key=value, got {item!r}; e.g. attack=5.0"
+            )
+        k, v = item.split("=", 1)
+        out[k.strip()] = float(v)
+    return out
+
+
 def run(args: argparse.Namespace) -> None:
     os.makedirs(args.output_dir, exist_ok=True)
     logger = EpisodeLogger(output_dir=args.output_dir)
@@ -130,6 +186,24 @@ def run(args: argparse.Namespace) -> None:
     else:
         agent, agent_cfg = None, {"past_action_k": 0, "chunk_size": 1, "use_language": True}
     past_action_k = agent_cfg["past_action_k"]
+
+    # Per-binary-action decoding calibration (no_move_fix.md follow-on): shift
+    # / flatten the binary head outputs at inference time without retraining.
+    # All three are None when the user supplied no overrides — map_to_minerl_action
+    # then falls back to its scalar threshold/temperature, byte-identical to the
+    # legacy code path.
+    temp_overrides = _parse_kv_overrides(args.binary_temperatures)
+    thr_overrides = _parse_kv_overrides(args.binary_thresholds)
+    bias_overrides = _parse_kv_overrides(args.binary_logit_bias)
+    binary_temperatures = (
+        build_per_action_vector(temp_overrides, args.temperature) if temp_overrides else None
+    )
+    binary_thresholds = (
+        build_per_action_vector(thr_overrides, 0.5) if thr_overrides else None
+    )
+    binary_logit_bias = (
+        build_per_action_vector(bias_overrides, 0.0) if bias_overrides else None
+    )
 
     env = gym.make(args.env)
     env, color_applied = eval_envs.maybe_wrap_color(env, args.env, args.color_match)
@@ -145,6 +219,14 @@ def run(args: argparse.Namespace) -> None:
     else:
         policy_desc = f"{type(agent).__name__} on {device} from {args.model_path}"
     print(f"Policy: {policy_desc}")
+    if temp_overrides:
+        print(f"Binary temperatures (overrides): {temp_overrides}")
+    if thr_overrides:
+        print(f"Binary thresholds (overrides): {thr_overrides}")
+    if bias_overrides:
+        print(f"Binary logit bias (overrides): {bias_overrides}")
+    if args.camera_temperature is not None:
+        print(f"Camera temperature: {args.camera_temperature}")
     print(f"Episodes: {args.episodes}   Max steps: {args.max_steps}")
     print()
 
@@ -189,6 +271,10 @@ def run(args: argparse.Namespace) -> None:
                     base_action=no_op_template,
                     sample=args.sample,
                     temperature=args.temperature,
+                    binary_temperatures=binary_temperatures,
+                    binary_thresholds=binary_thresholds,
+                    binary_logit_bias=binary_logit_bias,
+                    camera_temperature=args.camera_temperature,
                 )
                 action_vec = logits.detach().cpu().tolist()
                 if past_action_k > 0:
@@ -302,6 +388,43 @@ def main() -> None:
         type=float,
         default=1.0,
         help="Decode temperature for --sample (>1 flattens, <1 sharpens).",
+    )
+    parser.add_argument(
+        "--binary-temperatures",
+        nargs="*",
+        metavar="ACTION=T",
+        help="Per-action temperature overrides for the binary head under --sample. "
+        "Other binary actions inherit --temperature. Example: "
+        "--binary-temperatures attack=5.0  flattens just the (suppressed) attack "
+        "sigmoid back toward 0.5 on a no_move_fix-trained model.",
+    )
+    parser.add_argument(
+        "--binary-thresholds",
+        nargs="*",
+        metavar="ACTION=THR",
+        help="Per-action threshold overrides for the binary head in GREEDY mode "
+        "(ignored under --sample). Other binary actions inherit threshold=0.5. "
+        "Example: --binary-thresholds attack=0.005 lets a fix-trained model "
+        "fire attack often despite its mean logit being ~-4.5.",
+    )
+    parser.add_argument(
+        "--binary-logit-bias",
+        nargs="*",
+        metavar="ACTION=B",
+        help="Additive bias on binary logits before sigmoid (applies in BOTH modes). "
+        "Equivalent at inference time to retraining without the class-balanced "
+        "loss — shifts the model's output distribution back to the demo prior. "
+        "Example: --binary-logit-bias attack=6.0 on a chop fix model brings "
+        "attack sigmoid mean from ~0.025 back to ~0.82.",
+    )
+    parser.add_argument(
+        "--camera-temperature",
+        type=float,
+        default=None,
+        help="Override temperature for the camera softmax under --sample (both axes). "
+        "Default None inherits --temperature. Higher T (e.g. 2.0–3.0) flattens the "
+        "11-way categorical so the demo-majority 0° bin stops dominating, letting "
+        "the agent actually look around. Pairs with greedy or hot binaries.",
     )
     args = parser.parse_args()
     run(args)

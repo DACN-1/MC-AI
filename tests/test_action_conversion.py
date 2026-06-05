@@ -188,6 +188,58 @@ class MapToMineRLActionTests(unittest.TestCase):
         # And our predicted keys still override
         self.assertEqual(out["attack"], 0)
 
+    def test_camera_temperature_flattens_distribution(self):
+        """High camera_temperature should sample non-argmax bins despite a
+        clearly peaked logit vector. Verifies the camera-only T knob is wired
+        through and does not affect the legacy default path."""
+        # Bin 5 (0°) gets the largest logit by 3 nats — sample would normally
+        # land there ~95% of the time at T=1, but flatten massively at T=10.
+        logits = torch.full((NUM_OUTPUT_LOGITS,), -10.0)
+        cam_x_start = NUM_BINARY
+        cam_y_start = NUM_BINARY + NUM_CAMERA_BINS
+        # Set the 0°-bin (index 5) to 3.0, neighbors to 0.0, far-from-zero to -3.
+        for axis_start in (cam_x_start, cam_y_start):
+            logits[axis_start + 5] = 3.0
+            logits[axis_start + 4] = 0.0
+            logits[axis_start + 6] = 0.0
+
+        # Without the override: scalar T=1 → strong bias toward bin 5.
+        gen = torch.Generator().manual_seed(0)
+        baseline_x_bins = []
+        for _ in range(200):
+            out = map_to_minerl_action(logits, sample=True, temperature=1.0, generator=gen)
+            bin_x = int(DEFAULT_CAMERA_QUANTIZER.discretize(out["camera"])[0])
+            baseline_x_bins.append(bin_x)
+        baseline_p_bin5 = sum(b == 5 for b in baseline_x_bins) / len(baseline_x_bins)
+
+        # With camera_temperature=10 (very hot), bin-5 mass drops sharply.
+        gen = torch.Generator().manual_seed(0)
+        hot_x_bins = []
+        for _ in range(200):
+            out = map_to_minerl_action(
+                logits, sample=True, temperature=1.0, camera_temperature=10.0, generator=gen
+            )
+            bin_x = int(DEFAULT_CAMERA_QUANTIZER.discretize(out["camera"])[0])
+            hot_x_bins.append(bin_x)
+        hot_p_bin5 = sum(b == 5 for b in hot_x_bins) / len(hot_x_bins)
+
+        # Sanity: hot sampling visits more distinct bins.
+        self.assertGreater(len(set(hot_x_bins)), len(set(baseline_x_bins)))
+        # And puts substantially less mass on bin 5.
+        self.assertLess(hot_p_bin5, baseline_p_bin5 - 0.1)
+
+    def test_camera_temperature_default_preserves_legacy(self):
+        """camera_temperature=None must be byte-identical to omitting it."""
+        torch.manual_seed(0)
+        logits = torch.randn(NUM_OUTPUT_LOGITS)
+        gen_a = torch.Generator().manual_seed(42)
+        out_a = map_to_minerl_action(logits, sample=True, temperature=1.5, generator=gen_a)
+        gen_b = torch.Generator().manual_seed(42)
+        out_b = map_to_minerl_action(
+            logits, sample=True, temperature=1.5, camera_temperature=None, generator=gen_b
+        )
+        np.testing.assert_array_equal(out_a["camera"], out_b["camera"])
+
     def test_round_trip_contractor_action(self):
         """Lossless: contractor demo -> action_to_tensor -> bin -> argmax logits ->
         map_to_minerl_action -> action_to_tensor recovers the same tensor."""
