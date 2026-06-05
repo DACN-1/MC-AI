@@ -100,11 +100,20 @@ class _Combined640EnvSpec(HumanControlEnvSpec):
     """
 
     def __init__(self, name, fixed_biome, inventory, reward_items,
-                 break_speed_multiplier=1.0):
+                 break_speed_multiplier=1.0, start_pitch=None):
         self.fixed_biome = fixed_biome
         self.inventory = inventory
         self.reward_items = reward_items
         self.break_speed_multiplier = float(break_speed_multiplier)
+        # If start_pitch is set (degrees, Malmo convention: positive = look down),
+        # the agent spawns at a fixed XYZ with pitch override. Forces an aim
+        # condition for evaluation where the trained head can't reliably point
+        # downward by itself — the contractor data is heavily zero-pitch and
+        # cam_weight isn't enough to overcome the prior. Yaw is left at 0.
+        # XYZ is fixed at (0.5, 80, 0.5): above the procedural forest surface,
+        # agent falls ~15 blocks onto terrain in <30 ticks. Procedural forest
+        # generation around spawn near (0,0) reliably puts trees within view.
+        self.start_pitch = None if start_pitch is None else float(start_pitch)
         super().__init__(
             name=name,
             max_episode_steps=_MAX_EPISODE_STEPS,
@@ -124,6 +133,10 @@ class _Combined640EnvSpec(HumanControlEnvSpec):
             start.append(handlers.SimpleInventoryAgentStart(self.inventory))
         if self.break_speed_multiplier != 1.0:
             start.append(handlers.AgentStartBreakSpeedMultiplier(self.break_speed_multiplier))
+        if self.start_pitch is not None:
+            start.append(handlers.AgentStartPlacement(
+                x=0.5, y=80, z=0.5, yaw=0.0, pitch=self.start_pitch,
+            ))
         return start
 
     def create_agent_handlers(self) -> List[Handler]:
@@ -200,6 +213,19 @@ _SPECS = [
         inventory=[],
         reward_items=[dict(type="dirt", amount=1, reward=1.0)],
         break_speed_multiplier=5.0,
+    ),
+    # Force-aim variant: same as Fast but spawns at fixed XYZ looking down 20°
+    # so the crosshair lands on a tree trunk if any is in the spawn vicinity.
+    # Tests whether the current no_move_fix CLIP head can complete the chop
+    # task given a fair starting aim — diagnoses pitch-policy collapse vs
+    # other failure modes.
+    _Combined640EnvSpec(
+        "MineRLChopATree640FastAim-v0",
+        fixed_biome=BIOME_FOREST,
+        inventory=[],
+        reward_items=[dict(type="log", amount=1, reward=1.0)],
+        break_speed_multiplier=5.0,
+        start_pitch=20.0,
     ),
 ]
 
