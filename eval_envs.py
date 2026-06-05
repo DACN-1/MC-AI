@@ -83,12 +83,28 @@ class _Combined640EnvSpec(HumanControlEnvSpec):
 
     Mirrors MineRL's ``Treechop`` task methods but on the ``HumanControlEnvSpec``
     base so the action/observation space matches the BASALT-style models.
+
+    ``break_speed_multiplier`` is the Malmo ``BreakSpeedMultiplier`` knob (1.0 =
+    vanilla Minecraft speed). Bare-handed log mining at speed 1.0 takes ~3 s of
+    sustained attack on the same block (~60 ticks @ 20 tps), and the agent has
+    to *then* walk over the dropped log for ``RewardForCollectingItems`` to fire.
+    Across the typical 1000-step rollout, with stochastic head decoding +
+    bare-handed slowness, that compound event rarely lands — every rollout this
+    session returned ``total_reward = 0`` even when ``rollout_logs/exp2_thr/
+    episode_004.mp4`` visibly shows the agent chopping a tree. Setting
+    ``break_speed_multiplier=5.0`` collapses one break to ~12 ticks (~0.6 s), so
+    the inventory-reward criterion has a fair shot of firing inside the rollout
+    horizon. Frames are unchanged (the held-item slot stays empty); only the
+    block-damage rate the engine applies per attack tick is scaled. The
+    visual training distribution is unaffected.
     """
 
-    def __init__(self, name, fixed_biome, inventory, reward_items):
+    def __init__(self, name, fixed_biome, inventory, reward_items,
+                 break_speed_multiplier=1.0):
         self.fixed_biome = fixed_biome
         self.inventory = inventory
         self.reward_items = reward_items
+        self.break_speed_multiplier = float(break_speed_multiplier)
         super().__init__(
             name=name,
             max_episode_steps=_MAX_EPISODE_STEPS,
@@ -106,6 +122,8 @@ class _Combined640EnvSpec(HumanControlEnvSpec):
         start = super().create_agent_start()
         if self.inventory:
             start.append(handlers.SimpleInventoryAgentStart(self.inventory))
+        if self.break_speed_multiplier != 1.0:
+            start.append(handlers.AgentStartBreakSpeedMultiplier(self.break_speed_multiplier))
         return start
 
     def create_agent_handlers(self) -> List[Handler]:
@@ -162,6 +180,27 @@ _SPECS = [
         inventory=[],  # bare-handed: matches the generation agent (info.json inventory=None)
         reward_items=[dict(type="dirt", amount=1, reward=1.0)],
     ),
+    # Fast variants: identical except for BreakSpeedMultiplier=5.0. Use these
+    # for BC evaluation where total_reward needs to be a usable signal — the
+    # default envs almost never see reward fire (bare-handed log break = ~3 s
+    # sustained attack on the same block + walk over the dropped item, a
+    # compound event that rarely lands in 1000-step rollouts). The Fast
+    # variants drop log-break to ~0.6 s, so a competent agent's reward signal
+    # actually fires.
+    _Combined640EnvSpec(
+        "MineRLChopATree640Fast-v0",
+        fixed_biome=BIOME_FOREST,
+        inventory=[],
+        reward_items=[dict(type="log", amount=1, reward=1.0)],
+        break_speed_multiplier=5.0,
+    ),
+    _Combined640EnvSpec(
+        "MineRLCollectDirt640Fast-v0",
+        fixed_biome=BIOME_PLAINS,
+        inventory=[],
+        reward_items=[dict(type="dirt", amount=1, reward=1.0)],
+        break_speed_multiplier=5.0,
+    ),
 ]
 
 
@@ -189,6 +228,11 @@ _register_specs()
 _LAB_TARGETS_FALLBACK = {
     "MineRLChopATree640-v0": [63.88, 40.62, 118.27, 10.60, 131.59, 11.33],
     "MineRLCollectDirt640-v0": [81.21, 32.54, 119.52, 10.67, 123.47, 12.13],
+    # Fast variants share their parent task's training-distribution color
+    # statistics — the BreakSpeedMultiplier only changes mining mechanics,
+    # not rendering.
+    "MineRLChopATree640Fast-v0": [63.88, 40.62, 118.27, 10.60, 131.59, 11.33],
+    "MineRLCollectDirt640Fast-v0": [81.21, 32.54, 119.52, 10.67, 123.47, 12.13],
 }
 
 
