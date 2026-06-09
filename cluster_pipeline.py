@@ -156,8 +156,10 @@ def main():
     parser.add_argument(
         "--cache-batch-size",
         type=int,
-        default=16,
-        help="Batch size for the one-time backbone forward pass during cache build",
+        default=32,
+        help="Batch size for the one-time backbone forward pass during cache build. "
+             "32 is tuned for RTX 5090 (sm_120, no FA2) + bf16 LLaVA; bisect up "
+             "(40/48/64) if nvidia-smi shows headroom, down to 24/16 on OOM.",
     )
     parser.add_argument(
         "--past-action-k",
@@ -179,7 +181,7 @@ def main():
         "HeadOnlyAgent fall back to feature_dim (the legacy 1x compression). "
         "Pin to a constant (e.g. 2048) across all 4 ablation cells to remove the "
         "head-capacity asymmetry between CLIP (1536) and LLaVA (8192 after split "
-        "pooling) — see docs/alignment_handoff.md Phase C Step 1.",
+        "pooling) — see docs/_archive/alignment_handoff_2026-06-04.md Phase C Step 1.",
     )
     parser.add_argument(
         "--frame-stride",
@@ -207,6 +209,57 @@ def main():
         default=0.0,
         help="Probability of zeroing the whole past-action vector per sample during "
         "training; breaks the no-move past-action feedback trap.",
+    )
+    parser.add_argument(
+        "--frame-weight-multiplier",
+        type=float,
+        default=1.0,
+        help="WeightedRandomSampler multiplier for frames inside sustained-attack "
+        "runs (≥ --frame-weight-min-run ticks). 1.0 = uniform sampling. Try 5.0 "
+        "to upweight the rare chop-closure frames the BC loss otherwise can't "
+        "find. Cache-safe (only changes the DataLoader sampler).",
+    )
+    parser.add_argument(
+        "--frame-weight-min-run",
+        type=int,
+        default=60,
+        help="Minimum sustained-attack run length (ticks) to count as task-active "
+        "for --frame-weight-multiplier. 60 ticks ≈ 3 s at 20 fps — covers a "
+        "vanilla-Minecraft log break (~3 s of sustained attack).",
+    )
+    parser.add_argument(
+        "--learnable-bce-temp",
+        action="store_true",
+        help="Add a per-binary-action learnable temperature on the head's binary "
+        "logits. Trained jointly; sharpens sigmoid outputs at inference so the "
+        "rollout doesn't need decode-time --binary-thresholds / --binary-logit-bias.",
+    )
+    parser.add_argument(
+        "--focal-gamma",
+        type=float,
+        default=0.0,
+        help="Focal-loss exponent on the binary BCE: FL = (1-p_t)^gamma * BCE. "
+        "gamma=2.0 typical. Heavily upweights hard examples — pushes rare "
+        "movement actions (F1 0.15-0.6) without affecting attack (F1 0.97).",
+    )
+    parser.add_argument(
+        "--past-action-slot-dropout",
+        type=float,
+        default=0.0,
+        help="Per-slot Bernoulli dropout on the past-action vector — independently "
+        "zeros each of the K slots with this probability. Finer-grained than "
+        "--history-dropout (which zeros all K at once). Robustifies the head "
+        "against its own noisy past_action buffer at inference. 0.0 = off; "
+        "0.3 typical.",
+    )
+    parser.add_argument(
+        "--chop-oversample-weight",
+        type=float,
+        default=1.0,
+        help="Multiplier on WeightedRandomSampler weight for samples whose stem "
+        "starts with 'chop_a_tree'. 1.0 = uniform (default). 3.0 makes chop "
+        "samples 3x more likely than dirt samples. Composes multiplicatively "
+        "with --frame-weight-multiplier. Cache-safe.",
     )
     parser.add_argument(
         "--end-to-end",
@@ -329,6 +382,12 @@ def main():
                 restart=args.restart,
                 weighted_loss=args.weighted_loss,
                 history_dropout=args.history_dropout,
+                frame_weight_multiplier=args.frame_weight_multiplier,
+                frame_weight_min_run=args.frame_weight_min_run,
+                learnable_bce_temp=args.learnable_bce_temp,
+                focal_gamma=args.focal_gamma,
+                past_action_slot_dropout=args.past_action_slot_dropout,
+                chop_oversample_weight=args.chop_oversample_weight,
             )
         else:
             from feature_cache import CachedFeatureDataset, HeadOnlyAgent
@@ -351,6 +410,7 @@ def main():
                 past_action_dim=cfg.get("past_action_dim", 0),
                 chunk_size=chunk_size,
                 hidden_dim=cfg.get("hidden_dim"),
+                learnable_bce_temp=cfg.get("learnable_bce_temp", False),
             ).to(args.device)
             model.load_state_dict(ckpt["state_dict"])
             test_size = int(len(dataset) * 0.1)

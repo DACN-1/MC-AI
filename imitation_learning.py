@@ -246,6 +246,7 @@ def vla_loss(
     targets: th.Tensor,
     pos_weight: th.Tensor | None = None,
     cam_weight: th.Tensor | None = None,
+    focal_gamma: float = 0.0,
 ) -> tuple[th.Tensor, float, float]:
     """BCE on binary actions + cross-entropy on each camera axis, averaged over
     the chunk axis when present.
@@ -262,6 +263,14 @@ def vla_loss(
         cam_weight: optional (NUM_CAMERA_BINS,) cross-entropy class weights shared
                  by both camera axes. Downweights the dominant 0° bin so the head
                  doesn't collapse onto the majority class.
+        focal_gamma: if > 0, replace plain BCE with focal-weighted BCE on the
+                 binary head: FL = (1 - p_t)^gamma * BCE_elementwise. gamma=2.0
+                 is typical. Heavily upweights hard examples (low p_t for
+                 positive targets, high p_t for negatives) so the head doesn't
+                 collapse onto easy-to-predict actions (e.g. attack at 96% F1)
+                 while leaving rare movement keys at 15-60% F1. Composes with
+                 pos_weight when both are set, though focal alone is usually
+                 enough.
 
     Returns (total_loss, bce_value, camera_ce_value).
     """
@@ -283,9 +292,18 @@ def vla_loss(
     if cam_weight is not None:
         cam_weight = cam_weight.to(cam_x_logits.device, cam_x_logits.dtype)
 
-    bce = nn.functional.binary_cross_entropy_with_logits(
-        binary_logits, binary_targets, pos_weight=pos_weight
-    )
+    if focal_gamma > 0:
+        bce_elem = nn.functional.binary_cross_entropy_with_logits(
+            binary_logits, binary_targets, pos_weight=pos_weight, reduction="none"
+        )
+        p = th.sigmoid(binary_logits)
+        p_t = p * binary_targets + (1.0 - p) * (1.0 - binary_targets)
+        focal_w = (1.0 - p_t).clamp(min=1e-8).pow(focal_gamma)
+        bce = (focal_w * bce_elem).mean()
+    else:
+        bce = nn.functional.binary_cross_entropy_with_logits(
+            binary_logits, binary_targets, pos_weight=pos_weight
+        )
     ce_x = nn.functional.cross_entropy(cam_x_logits, cam_x_targets, weight=cam_weight)
     ce_y = nn.functional.cross_entropy(cam_y_logits, cam_y_targets, weight=cam_weight)
     cam_ce = 0.5 * (ce_x + ce_y)
@@ -343,6 +361,81 @@ def compute_class_weights(
     )
 
 
+def compute_task_active_weights(
+    data_root: str | Path,
+    task_filter: str | None = None,
+    min_run_length: int = 60,
+    multiplier: float = 5.0,
+) -> dict[str, np.ndarray]:
+    """For each demo frame, return weight = `multiplier` if it sits inside a
+    sustained-attack run of length ≥ `min_run_length`, else 1.0.
+
+    Rationale: chop/dirt tasks reward the *closure* (sustained attack →
+    block-breaks → walk-onto-drop) but those frames are rare in the demos
+    (most frames are "walk around, look at terrain"). Without upweighting,
+    the BC head can minimize loss without learning the closure pattern —
+    which is exactly the failure we see at rollout (model attacks 70 %,
+    walks forward, but never completes a chop chain). Reweighting the
+    sampler so closure-context frames are sampled 5× as often gives the
+    head a real gradient signal on those rare transitions.
+
+    Per-frame inventory is NOT in `all_infos.json` (only the trajectory-level
+    final inventory under `results.inventory_dis_values.log`); the inventory-
+    delta proxy from the original handoff is therefore not available. The
+    sustained-attack-run proxy is close enough in practice — every successful
+    chop in the demos is the tail of a long attack run.
+
+    Returns: `{stem: weights_per_frame (n,) float32}`.
+    """
+    root = Path(data_root)
+    out: dict[str, np.ndarray] = {}
+    for traj_dir in _iter_trajectory_dirs(root, task_filter):
+        actions_path = traj_dir / "all_actions.json"
+        if not actions_path.exists():
+            continue
+        with actions_path.open("r", encoding="utf-8") as fp:
+            all_actions = json.load(fp)
+        for stem, actions in all_actions.items():
+            n = len(actions)
+            attack = np.zeros(n, dtype=bool)
+            for i, a in enumerate(actions):
+                v = a.get("attack", 0)
+                if isinstance(v, list):
+                    v = v[0]
+                attack[i] = int(v) == 1
+            weights = np.ones(n, dtype=np.float32)
+            i = 0
+            while i < n:
+                if attack[i]:
+                    j = i
+                    while j < n and attack[j]:
+                        j += 1
+                    if j - i >= min_run_length:
+                        weights[i:j] = multiplier
+                    i = j
+                else:
+                    i += 1
+            out[stem] = weights
+    if not out:
+        raise RuntimeError(
+            f"compute_task_active_weights: no trajectories under {root} "
+            f"(task_filter={task_filter!r}) — check the data path"
+        )
+    return out
+
+
+def _iter_trajectory_dirs(root: Path, task_filter: str | None):
+    """Inline copy of feature_cache._iter_trajectory_dirs to avoid a cyclic
+    import (imitation_learning is imported by cluster_pipeline before
+    feature_cache.precompute runs in the same process).
+    """
+    for d in sorted(root.iterdir()):
+        if not d.is_dir() or not d.name.startswith("trajectory_task_"):
+            continue
+        if task_filter is None or task_filter in d.name:
+            yield d
+
+
 def apply_history_dropout(pasts: th.Tensor, p: float) -> th.Tensor:
     """Randomly zero the entire past-action vector for a fraction `p` of samples.
 
@@ -358,6 +451,34 @@ def apply_history_dropout(pasts: th.Tensor, p: float) -> th.Tensor:
         return pasts
     keep = (th.rand(pasts.size(0), 1, device=pasts.device) >= p).to(pasts.dtype)
     return pasts * keep
+
+
+def apply_past_action_slot_dropout(
+    pasts: th.Tensor, p: float, past_action_k: int
+) -> th.Tensor:
+    """Per-slot Bernoulli dropout: with prob `p`, zero each of the K past-action
+    slots INDEPENDENTLY. Finer-grained than `apply_history_dropout` (which zeros
+    the whole vector or nothing).
+
+    Why: at rollout the past_action buffer is the head's *own* recent predictions,
+    which drift from the demo distribution. history_dropout (whole-vector) is a
+    blunt instrument — when applied, it removes ALL temporal context; when not
+    applied, the head is trusted blindly. Per-slot dropout teaches robustness to
+    any subset of slots being corrupted — closer to the noisy-buffer scenario
+    that actually happens at inference. No-op when p<=0 or past_action_k==0.
+
+    Args:
+        pasts: (B, K * PAST_ACTION_DIM)
+        p: per-slot dropout probability
+        past_action_k: K (number of slots)
+    """
+    if p <= 0.0 or pasts.size(-1) == 0 or past_action_k <= 0:
+        return pasts
+    B = pasts.size(0)
+    D = pasts.size(-1) // past_action_k
+    pasts_3d = pasts.view(B, past_action_k, D)
+    keep = (th.rand(B, past_action_k, 1, device=pasts.device) >= p).to(pasts.dtype)
+    return (pasts_3d * keep).view(B, past_action_k * D)
 
 
 def _collate(batch):
@@ -688,6 +809,12 @@ def train_cached_head(
     restart: bool = False,
     weighted_loss: bool = False,
     history_dropout: float = 0.0,
+    frame_weight_multiplier: float = 1.0,
+    frame_weight_min_run: int = 60,
+    learnable_bce_temp: bool = False,
+    focal_gamma: float = 0.0,
+    past_action_slot_dropout: float = 0.0,
+    chop_oversample_weight: float = 1.0,
 ):
     """Train an MLP head on precomputed backbone features.
 
@@ -743,10 +870,70 @@ def train_cached_head(
     out_path = Path(out_weights)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
+    # Frame-weighted and/or task-weighted sampling.
+    sampler = None
+    train_shuffle = True
+    use_weighted_sampler = (
+        frame_weight_multiplier > 1.0 or chop_oversample_weight != 1.0
+    )
+    if use_weighted_sampler:
+        per_sample = np.ones(len(dataset), dtype=np.float64)
+        # Frame-level weighting (sustained-attack runs).
+        if frame_weight_multiplier > 1.0:
+            stem_weights = compute_task_active_weights(
+                data_root,
+                task_filter=None,  # cache_tag's task_filter is encoded in the cache;
+                # at this stage we want weights for whatever stems landed in the cache
+                min_run_length=frame_weight_min_run,
+                multiplier=frame_weight_multiplier,
+            )
+            unmatched = 0
+            for idx, (stem, fidx) in enumerate(dataset.samples):
+                w = stem_weights.get(stem)
+                if w is None or fidx >= len(w):
+                    unmatched += 1
+                    continue
+                per_sample[idx] = float(w[fidx])
+        # Task-level weighting (chop vs dirt). Composes multiplicatively with
+        # frame_weight when both are set. Stems are named "chop_a_tree_*" and
+        # "collect_dirt_*"; everything not chop is treated as 1.0.
+        if chop_oversample_weight != 1.0:
+            n_chop = 0
+            for idx, (stem, _) in enumerate(dataset.samples):
+                if stem.startswith("chop_a_tree"):
+                    per_sample[idx] *= chop_oversample_weight
+                    n_chop += 1
+            print(
+                f"Chop oversample ON — weight={chop_oversample_weight}; "
+                f"{n_chop:,}/{len(dataset):,} chop samples weighted"
+            )
+        train_weights = per_sample[list(train_set.indices)]
+        sampler = th.utils.data.WeightedRandomSampler(
+            weights=th.from_numpy(train_weights),
+            num_samples=len(train_weights),
+            replacement=True,
+        )
+        train_shuffle = False
+        if frame_weight_multiplier > 1.0:
+            active = int((per_sample > 1.0).sum())
+            print(
+                f"Frame-weighted sampling ON — multiplier={frame_weight_multiplier} "
+                f"min_run={frame_weight_min_run}; active_frames={active:,}/{len(dataset):,} "
+                f"({100 * active / len(dataset):.1f}%); unmatched_stems={unmatched}"
+            )
+
+    if learnable_bce_temp:
+        print("Learnable per-action BCE temperature ON (init=1.0)")
+    if focal_gamma > 0:
+        print(f"Focal BCE ON — gamma={focal_gamma}")
+    if past_action_slot_dropout > 0:
+        print(f"Past-action per-slot dropout ON — p={past_action_slot_dropout}")
+
     train_loader = DataLoader(
         train_set,
         batch_size=batch_size,
-        shuffle=True,
+        shuffle=train_shuffle,
+        sampler=sampler,
         num_workers=num_workers,
         collate_fn=_cached_collate,
         persistent_workers=num_workers > 0,
@@ -767,6 +954,7 @@ def train_cached_head(
         past_action_dim=past_action_dim,
         chunk_size=chunk_size,
         hidden_dim=hidden_dim,
+        learnable_bce_temp=learnable_bce_temp,
     ).to(device)
     optim = th.optim.Adam(model.parameters(), lr=lr)
 
@@ -798,6 +986,12 @@ def train_cached_head(
                     "test_split": test_split,
                     "weighted_loss": weighted_loss,
                     "history_dropout": history_dropout,
+                    "frame_weight_multiplier": frame_weight_multiplier,
+                    "frame_weight_min_run": frame_weight_min_run,
+                    "learnable_bce_temp": learnable_bce_temp,
+                    "focal_gamma": focal_gamma,
+                    "past_action_slot_dropout": past_action_slot_dropout,
+                    "chop_oversample_weight": chop_oversample_weight,
                     "camera_quantizer": {
                         "camera_maxval": DEFAULT_CAMERA_QUANTIZER.camera_maxval,
                         "camera_binsize": DEFAULT_CAMERA_QUANTIZER.camera_binsize,
@@ -818,10 +1012,16 @@ def train_cached_head(
         for feats, acts, pasts in train_loader:
             feats = feats.to(device)
             acts = acts.to(device)
-            pasts = apply_history_dropout(pasts.to(device), history_dropout)
+            pasts = pasts.to(device)
+            pasts = apply_history_dropout(pasts, history_dropout)
+            pasts = apply_past_action_slot_dropout(
+                pasts, past_action_slot_dropout, past_action_k
+            )
             optim.zero_grad()
             logits = model(feats, pasts)
-            loss, bce_v, cam_v = vla_loss(logits, acts, pos_weight, cam_weight)
+            loss, bce_v, cam_v = vla_loss(
+                logits, acts, pos_weight, cam_weight, focal_gamma=focal_gamma
+            )
             loss.backward()
             optim.step()
             train_total += loss.item()
@@ -842,7 +1042,9 @@ def train_cached_head(
                 acts = acts.to(device)
                 pasts = pasts.to(device)
                 logits = model(feats, pasts)
-                loss, bce_v, cam_v = vla_loss(logits, acts, pos_weight, cam_weight)
+                loss, bce_v, cam_v = vla_loss(
+                    logits, acts, pos_weight, cam_weight, focal_gamma=focal_gamma
+                )
                 val_total += loss.item()
                 val_bce += bce_v
                 val_cam += cam_v

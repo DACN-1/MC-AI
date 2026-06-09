@@ -156,6 +156,77 @@ def _resolve_device(requested: str) -> str:
     return requested
 
 
+class InventoryRewardWrapper(gym.Wrapper):
+    """Replace MineRL's broken-in-our-stack `RewardForPossessingItem` with an
+    inventory-delta reward computed on the Python side.
+
+    Malmo's Java reward handler silently fails to fire on inventory gains in
+    our docker MineRL setup (see project_chop_reward_unreliable.md): every
+    rollout has `total_reward = 0` even when video shows items collected and
+    `obs["inventory"]` has positive counts. This wrapper uses the working
+    `FlatInventoryObservation` to compute the same reward inline, so
+    `env.step()` returns the right value and all downstream code (steps JSON,
+    eval_compare, total_reward) works unchanged.
+
+    Args:
+        env: a MineRL gym env with `FlatInventoryObservation` exposed as
+             `obs["inventory"]`.
+        item_rewards: per-item reward weight, e.g. `{"dirt": 1.0, "log": 1.0}`.
+             Only positive inventory deltas contribute.
+    """
+
+    def __init__(self, env, item_rewards: dict[str, float]):
+        super().__init__(env)
+        self.item_rewards = dict(item_rewards)
+        self._prev: dict[str, int] = {}
+
+    def reset(self, **kwargs):
+        self._prev = {}
+        return self.env.reset(**kwargs)
+
+    def step(self, action):
+        obs, reward, done, info = self.env.step(action)
+        inv = obs.get("inventory") if isinstance(obs, dict) else None
+        bonus = 0.0
+        if isinstance(inv, dict):
+            for item, weight in self.item_rewards.items():
+                try:
+                    cur = int(inv.get(item, 0))
+                except (TypeError, ValueError):
+                    continue
+                prev = self._prev.get(item, 0)
+                if cur > prev:
+                    bonus += (cur - prev) * float(weight)
+            # Refresh full snapshot (not just tracked items) so dropouts don't
+            # accidentally double-count on the next tick. NumPy scalars don't
+            # match the Python `int`/`float` ABCs on some torch/numpy combos —
+            # try int() directly and skip values that don't cast.
+            new_prev: dict[str, int] = {}
+            for k, v in inv.items():
+                try:
+                    new_prev[k] = int(v)
+                except (TypeError, ValueError):
+                    continue
+            self._prev = new_prev
+        return obs, float(reward) + bonus, done, info
+
+
+# Mapping from env-id substring to the items whose inventory delta we reward.
+# Mirrors eval_envs.py's reward_items but bypasses Malmo's broken handler.
+_INVENTORY_REWARD_BY_ENV = (
+    ("ChopATree", {"log": 1.0}),
+    ("CollectDirt", {"dirt": 1.0}),
+)
+
+
+def _maybe_wrap_inventory_reward(env, env_id: str):
+    for needle, items in _INVENTORY_REWARD_BY_ENV:
+        if needle in env_id:
+            print(f"InventoryRewardWrapper: tracking {items} for {env_id}")
+            return InventoryRewardWrapper(env, items)
+    return env
+
+
 def _parse_kv_overrides(items: list[str] | None) -> dict[str, float]:
     """Parse a list of ``key=value`` strings into a {key: float} dict.
 
@@ -206,6 +277,7 @@ def run(args: argparse.Namespace) -> None:
     )
 
     env = gym.make(args.env)
+    env = _maybe_wrap_inventory_reward(env, args.env)
     env, color_applied = eval_envs.maybe_wrap_color(env, args.env, args.color_match)
     # Captured once: gives us the canonical key set including pickItem/swapHands,
     # which the model doesn't predict. We merge it under predicted actions per step.
@@ -233,6 +305,25 @@ def run(args: argparse.Namespace) -> None:
     episode_rows: list[dict] = []
 
     for ep_idx in range(args.episodes):
+        if args.seed is not None:
+            ep_seed = int(args.seed) + ep_idx
+            # MineRL inherits the gym 0.23 API — seed() takes the env seed and
+            # is applied to the NEXT reset(). Calling it on every iter ensures
+            # deterministic reseed even if the env's internal RNG drifted.
+            try:
+                env.seed(ep_seed)
+            except Exception as exc:  # noqa: BLE001
+                print(f"  WARN: env.seed({ep_seed}) failed: {exc}")
+            # Also seed numpy + torch so any agent-side sampling (Bernoulli
+            # binary, softmax camera) is reproducible across runs.
+            np.random.seed(ep_seed)
+            try:
+                import torch as _torch
+                _torch.manual_seed(ep_seed)
+                if _torch.cuda.is_available():
+                    _torch.cuda.manual_seed_all(ep_seed)
+            except Exception:
+                pass
         obs = env.reset()
         step_log = []
 
@@ -288,6 +379,24 @@ def run(args: argparse.Namespace) -> None:
             if writer is not None:
                 writer.write(cv2.cvtColor(obs["pov"], cv2.COLOR_RGB2BGR))
 
+            # Snapshot inventory (FlatInventoryObservation gives a dict).
+            # MineRL's RewardForCollectingItems / Malmo's RewardForPossessingItem
+            # silently does not fire on log/dirt collection events in this
+            # env config (confirmed by video: dirt visibly in HUD with
+            # total_reward=0 across 1000 steps — see
+            # output/evaluation/20260608_161320_lang_slot30/D_dirt_task/
+            # episode_002.mp4). Log only nonzero items to keep file size sane.
+            inv_snap = {}
+            inv_obs = obs.get("inventory") if hasattr(obs, "get") else None
+            if isinstance(inv_obs, dict):
+                for k, v in inv_obs.items():
+                    try:
+                        iv = int(v)
+                    except (TypeError, ValueError):
+                        continue
+                    if iv > 0:
+                        inv_snap[k] = iv
+
             dominant = _dominant_action_key(minerl_action)
             logger.log_step(dominant, reward)
 
@@ -295,6 +404,7 @@ def run(args: argparse.Namespace) -> None:
                 {
                     "step": step,
                     "reward": float(reward),
+                    "inventory": inv_snap,
                     "done": bool(done),
                     "action_vec": action_vec,
                     "minerl_action": {
@@ -366,6 +476,15 @@ def main() -> None:
     parser.add_argument("--max-steps", type=int, default=500)
     parser.add_argument("--output-dir", default="./rollout_logs")
     parser.add_argument("--record-video", action="store_true", help="Save each episode as an MP4")
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Base RNG seed. Episode i uses seed=<base>+i for env.seed() and "
+        "torch/numpy RNGs, making rollouts deterministic across runs. Required "
+        "for comparing the same env+decode state across different models or "
+        "prompts (eval_suite). None = legacy non-deterministic behaviour.",
+    )
     parser.add_argument(
         "--device",
         default="cuda" if torch.cuda.is_available() else "cpu",
