@@ -195,7 +195,7 @@ def precompute(
     use_language: bool,
     task_filter: str | None = None,
     llava_id: str = "llava-hf/llava-1.5-7b-hf",
-    batch_size: int = 16,
+    batch_size: int = 32,
     device: str = "cuda" if th.cuda.is_available() else "cpu",
     tag: str | None = None,
     frame_stride: int = 1,
@@ -453,6 +453,12 @@ class HeadOnlyAgent(th.nn.Module):
 
     Mirrors `VLAAgent.action_head` exactly, so a checkpoint trained on cached
     features is structurally identical to the head trained end-to-end.
+
+    Optional `learnable_bce_temp` adds a per-binary-action scalar that divides
+    the binary logits in forward(). At training time the temperature is learned
+    alongside the head; at inference time it sharpens (or softens) the sigmoid
+    so the rollout doesn't need decode-time `--binary-thresholds` or
+    `--binary-logit-bias` flags. Camera CE logits are untouched.
     """
 
     def __init__(
@@ -462,6 +468,7 @@ class HeadOnlyAgent(th.nn.Module):
         past_action_dim: int = 0,
         chunk_size: int = 1,
         hidden_dim: int | None = None,
+        learnable_bce_temp: bool = False,
     ):
         super().__init__()
         self.feature_dim = feature_dim
@@ -469,11 +476,16 @@ class HeadOnlyAgent(th.nn.Module):
         self.past_action_dim = past_action_dim
         self.chunk_size = chunk_size
         self.hidden_dim = hidden_dim or feature_dim
+        self.learnable_bce_temp = learnable_bce_temp
         self.action_head = th.nn.Sequential(
             th.nn.Linear(feature_dim + past_action_dim, self.hidden_dim),
             th.nn.ReLU(),
             th.nn.Linear(self.hidden_dim, output_dim * chunk_size),
         )
+        if learnable_bce_temp:
+            # Per-binary-action temperature, init to 1.0. Stored as raw scalars
+            # (clamped > 1e-3 at use site) so the optimizer can move it freely.
+            self.bce_temperature = th.nn.Parameter(th.ones(NUM_BINARY))
 
     def forward(self, features: th.Tensor, past_actions: th.Tensor | None = None) -> th.Tensor:
         x = features
@@ -483,7 +495,14 @@ class HeadOnlyAgent(th.nn.Module):
             past = past_actions.to(x.device).to(x.dtype)
             x = th.cat([x, past], dim=-1)
         flat = self.action_head(x)
-        return flat.view(flat.size(0), self.chunk_size, self.output_dim)
+        logits = flat.view(flat.size(0), self.chunk_size, self.output_dim)
+        if self.learnable_bce_temp:
+            tau = self.bce_temperature.clamp_min(1e-3).view(1, 1, NUM_BINARY)
+            logits = th.cat(
+                [logits[..., :NUM_BINARY] / tau, logits[..., NUM_BINARY:]],
+                dim=-1,
+            )
+        return logits
 
 
 # ---------------------------------------------------------------------

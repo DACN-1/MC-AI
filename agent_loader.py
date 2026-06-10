@@ -49,12 +49,15 @@ def _load_cached_head_agent(ckpt: dict, cfg: dict, device: str):
     past_action_dim = cfg.get("past_action_dim", 0)
     chunk_size = cfg.get("chunk_size", 1)
     hidden_dim = cfg.get("hidden_dim")
-    # cache tags are "<backbone>_<task>_<lang|nolang>"; backbone is the prefix
-    # and the language flag is the suffix (the backbone encode() needs it).
-    # Falling back on feature_dim < 2048 catches CLIP-only (=1536) without
-    # confusing LLaVA-pre-Phase-C (=4096) and LLaVA-post-Phase-C (=8192) caches.
+    # cache tags are "<backbone>_<task>_<lang|nolang>[_strideN]" — the language
+    # flag is a token, NOT a suffix (a `_stride4` suffix used to silently break
+    # `endswith("nolang")`, loading nolang ckpts with use_language=True).
+    # Match the token directly. Backbone is still the prefix; fall back on
+    # feature_dim < 2048 to catch CLIP-only (=1536) without confusing LLaVA-pre-
+    # Phase-C (=4096) and LLaVA-post-Phase-C (=8192) caches.
     is_clip = cache_tag.startswith("clip") or feature_dim < 2048
-    use_language = not cache_tag.endswith("nolang")
+    tag_tokens = cache_tag.split("_")
+    use_language = "nolang" not in tag_tokens
 
     if is_clip:
         from frozen_vision_baseline import FrozenVisionAgent
@@ -80,6 +83,7 @@ def _load_cached_head_agent(ckpt: dict, cfg: dict, device: str):
         past_action_dim=past_action_dim,
         chunk_size=chunk_size,
         hidden_dim=hidden_dim,
+        learnable_bce_temp=cfg.get("learnable_bce_temp", False),
     )
     head.load_state_dict(ckpt["state_dict"])
 

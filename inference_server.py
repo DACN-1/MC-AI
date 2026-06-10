@@ -42,6 +42,11 @@ def build_handler(agent, agent_cfg, device):
     class _Handler(BaseHTTPRequestHandler):
         # Per-process request counter for a lightweight heartbeat.
         n_requests = 0
+        # HTTP/1.1 enables connection keep-alive, which is essential when the
+        # client is on the other end of a high-latency tunnel (TCP+SSH
+        # handshake per request adds ~1.5 s, dominating wall-clock). Pair with
+        # `Connection: keep-alive` from _RemoteAgent.
+        protocol_version = "HTTP/1.1"
 
         def log_message(self, *_args):  # silence default per-request logging
             pass
@@ -69,9 +74,16 @@ def build_handler(agent, agent_cfg, device):
             length = int(self.headers.get("Content-Length", 0))
             req = json.loads(self.rfile.read(length).decode("utf-8"))
 
-            arr = np.frombuffer(base64.b64decode(req["pov"]), dtype=np.uint8)
-            arr = arr.reshape(req["shape"])
-            img = Image.fromarray(arr)
+            # Prefer the JPEG-compressed payload from new clients (saves ~15x
+            # on the wire — see _RemoteAgent in run_rollout.py); fall back to
+            # the legacy raw uint8 base64 path for older clients.
+            if "pov_jpeg" in req:
+                import io as _io
+                img = Image.open(_io.BytesIO(base64.b64decode(req["pov_jpeg"]))).convert("RGB")
+            else:
+                arr = np.frombuffer(base64.b64decode(req["pov"]), dtype=np.uint8)
+                arr = arr.reshape(req["shape"])
+                img = Image.fromarray(arr)
             prompt = req.get("prompt", "")
             past = req.get("past") or []
             past_tensor = (
