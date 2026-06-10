@@ -129,7 +129,13 @@ for TASK in "${STAGE_TASKS[@]}"; do
         exit 1
     fi
     n_stems=$(python -c "import json; print(len(json.load(open('$ACTIONS_JSON'))))")
-    n_videos=$(find "$TRAJ_SUBDIR/videos" -maxdepth 1 -name 'video_*.mp4' 2>/dev/null | wc -l | tr -d ' ')
+    # NB: guard the missing-videos case explicitly — `find` on a nonexistent
+    # dir exits 1, and under `set -euo pipefail` that silently kills the job.
+    if [ -d "$TRAJ_SUBDIR/videos" ]; then
+        n_videos=$(find "$TRAJ_SUBDIR/videos" -maxdepth 1 -name 'video_*.mp4' 2>/dev/null | wc -l | tr -d ' ')
+    else
+        n_videos=0
+    fi
     echo "Stage check  $TASK: stems=$n_stems videos=$n_videos"
     if [ "$n_stems" -eq 0 ]; then
         echo "ERROR: trajectory_task_${TASK} has stems=0" >&2
