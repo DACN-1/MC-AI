@@ -17,6 +17,8 @@ import eval_envs  # noqa: F401 — registers custom 640x360 envs + color matchin
 from action_mapping import build_per_action_vector, map_to_minerl_action
 from agent_loader import load_agent as _load_local_agent
 from constants import (
+    BINARY_ACTION_KEYS,
+    NUM_BINARY,
     NUM_OUTPUT_LOGITS,
     PAST_ACTION_DIM,
     action_to_onehot,
@@ -227,6 +229,26 @@ def _maybe_wrap_inventory_reward(env, env_id: str):
     return env
 
 
+def _parse_attack_hysteresis(spec: str | None) -> tuple[int, float]:
+    """Parse ``--attack-hysteresis N[:THR]`` into (n_steps, threshold).
+
+    Returns (0, 0.5) when the flag is unset (hysteresis off).
+    """
+    if not spec:
+        return 0, 0.5
+    n_str, _, thr_str = spec.partition(":")
+    n = int(n_str)
+    thr = float(thr_str) if thr_str else 0.2
+    if n < 0 or not (0.0 < thr < 1.0):
+        raise ValueError(
+            f"--attack-hysteresis expects N>=0 and 0<THR<1, got {spec!r}"
+        )
+    return n, thr
+
+
+_ATTACK_IDX = BINARY_ACTION_KEYS.index("attack")
+
+
 def _parse_kv_overrides(items: list[str] | None) -> dict[str, float]:
     """Parse a list of ``key=value`` strings into a {key: float} dict.
 
@@ -276,6 +298,26 @@ def run(args: argparse.Namespace) -> None:
         build_per_action_vector(bias_overrides, 0.0) if bias_overrides else None
     )
 
+    # Temporal decode mechanisms (chop "temporal/behavioral" hypothesis —
+    # see docs/trials.md camera-axis verdict). All default-off; the legacy
+    # replan-every-tick + scalar-threshold path is byte-identical when unset.
+    chunk_size = int(agent_cfg.get("chunk_size", 1))
+    execute_steps = int(args.execute_steps)
+    if args.chunk_ensemble and execute_steps > 1:
+        raise SystemExit(
+            "--chunk-ensemble and --execute-steps are mutually exclusive: "
+            "ensembling needs a fresh plan every tick, open-loop skips replanning."
+        )
+    if execute_steps > chunk_size:
+        print(
+            f"WARN: --execute-steps {execute_steps} > model chunk_size "
+            f"{chunk_size}; clamping to {chunk_size}"
+        )
+        execute_steps = chunk_size
+    if args.chunk_ensemble and chunk_size < 2:
+        raise SystemExit("--chunk-ensemble needs a chunked model (chunk_size >= 2)")
+    hyst_n, hyst_thr = _parse_attack_hysteresis(args.attack_hysteresis)
+
     env = gym.make(args.env)
     env = _maybe_wrap_inventory_reward(env, args.env)
     env, color_applied = eval_envs.maybe_wrap_color(env, args.env, args.color_match)
@@ -299,6 +341,12 @@ def run(args: argparse.Namespace) -> None:
         print(f"Binary logit bias (overrides): {bias_overrides}")
     if args.camera_temperature is not None:
         print(f"Camera temperature: {args.camera_temperature}")
+    if args.chunk_ensemble:
+        print(f"Chunk ensembling: ON (averaging up to {chunk_size} overlapping plans)")
+    if execute_steps > 1:
+        print(f"Open-loop execution: first {execute_steps}/{chunk_size} chunk steps per plan")
+    if hyst_n > 0:
+        print(f"Attack hysteresis: threshold {hyst_thr} for {hyst_n} steps after attack fires")
     print(f"Episodes: {args.episodes}   Max steps: {args.max_steps}")
     print()
 
@@ -333,6 +381,15 @@ def run(args: argparse.Namespace) -> None:
             [np.zeros(PAST_ACTION_DIM, dtype=np.float32) for _ in range(past_action_k)],
             maxlen=past_action_k,
         )
+        # Temporal-decode state, reset per episode:
+        # - plan_history: (plan_step, (chunk_size, 43) logits) of recent plans;
+        #   at step t the ensemble averages plan[t - plan_step] over all plans
+        #   that still cover t (ACT-style temporal ensembling).
+        # - pending_logits: remaining open-loop steps from the current plan.
+        # - hyst_left: steps of lowered attack threshold remaining.
+        plan_history: deque = deque(maxlen=chunk_size)
+        pending_logits: list[torch.Tensor] = []
+        hyst_left = 0
 
         writer = None
         if args.record_video:
@@ -345,28 +402,65 @@ def run(args: argparse.Namespace) -> None:
 
         for step in range(args.max_steps):
             if agent is not None:
-                img = _obs_to_pil(obs)
-                if past_action_k > 0:
-                    past_tensor = torch.from_numpy(
-                        np.concatenate(list(past_buffer))
-                    ).unsqueeze(0)
+                if pending_logits:
+                    # Open-loop: consume the next step of the current plan
+                    # without a model forward.
+                    logits = pending_logits.pop(0)
                 else:
-                    past_tensor = torch.zeros(1, 0)
-                with torch.no_grad():
-                    # Model returns (1, chunk_size, NUM_OUTPUT_LOGITS); execute
-                    # only the first predicted step and replan next tick.
-                    chunk_logits = agent([img], [args.prompt], past_tensor)
-                    logits = chunk_logits[0, 0]
+                    img = _obs_to_pil(obs)
+                    if past_action_k > 0:
+                        past_tensor = torch.from_numpy(
+                            np.concatenate(list(past_buffer))
+                        ).unsqueeze(0)
+                    else:
+                        past_tensor = torch.zeros(1, 0)
+                    with torch.no_grad():
+                        # Model returns (1, chunk_size, NUM_OUTPUT_LOGITS).
+                        # Default: execute only the first predicted step and
+                        # replan next tick.
+                        chunk_logits = agent([img], [args.prompt], past_tensor)
+                    plan = chunk_logits[0]  # (chunk_size, NUM_OUTPUT_LOGITS)
+                    if args.chunk_ensemble:
+                        plan_history.append((step, plan))
+                        rows = [
+                            p[step - s]
+                            for s, p in plan_history
+                            if 0 <= step - s < p.size(0)
+                        ]
+                        logits = torch.stack(rows).mean(dim=0)
+                    else:
+                        logits = plan[0]
+                        if execute_steps > 1:
+                            pending_logits = [
+                                plan[j] for j in range(1, min(execute_steps, plan.size(0)))
+                            ]
+
+                eff_thresholds = binary_thresholds
+                if hyst_n > 0 and hyst_left > 0:
+                    # Sticky attack: lowered threshold while the hysteresis
+                    # window is open (greedy mode only — --sample has no
+                    # thresholds).
+                    eff_thresholds = (
+                        binary_thresholds.clone()
+                        if binary_thresholds is not None
+                        else torch.full((NUM_BINARY,), 0.5)
+                    )
+                    eff_thresholds[_ATTACK_IDX] = hyst_thr
                 minerl_action = map_to_minerl_action(
                     logits,
                     base_action=no_op_template,
                     sample=args.sample,
                     temperature=args.temperature,
                     binary_temperatures=binary_temperatures,
-                    binary_thresholds=binary_thresholds,
+                    binary_thresholds=eff_thresholds,
                     binary_logit_bias=binary_logit_bias,
                     camera_temperature=args.camera_temperature,
                 )
+                if hyst_n > 0:
+                    if minerl_action.get("attack", 0):
+                        hyst_left = hyst_n
+                    elif hyst_left > 0:
+                        hyst_left -= 1
                 action_vec = logits.detach().cpu().tolist()
                 if past_action_k > 0:
                     past_buffer.append(action_to_onehot(minerl_action))
@@ -544,6 +638,33 @@ def main() -> None:
         "Default None inherits --temperature. Higher T (e.g. 2.0–3.0) flattens the "
         "11-way categorical so the demo-majority 0° bin stops dominating, letting "
         "the agent actually look around. Pairs with greedy or hot binaries.",
+    )
+    parser.add_argument(
+        "--chunk-ensemble",
+        action="store_true",
+        help="ACT-style temporal ensembling: at step t, average the logits that "
+        "the last <=chunk_size plans predicted FOR step t (the plan from t-j "
+        "contributes its j-th step). Smooths the per-tick on/off jitter that "
+        "breaks sustained attack runs. Needs a chunked model; mutually "
+        "exclusive with --execute-steps.",
+    )
+    parser.add_argument(
+        "--execute-steps",
+        type=int,
+        default=1,
+        help="Open-loop execution: run the first K steps of each predicted chunk "
+        "before replanning (default 1 = legacy replan-every-tick). Tests "
+        "whether per-tick replanning thrash is what breaks chop commitment. "
+        "Clamped to the model's chunk_size.",
+    )
+    parser.add_argument(
+        "--attack-hysteresis",
+        metavar="N[:THR]",
+        default=None,
+        help="Sticky-attack decode (greedy mode): after attack fires, lower its "
+        "threshold to THR (default 0.2) for the next N steps, so marginal "
+        "logits keep an attack run going instead of dropping it mid-chop. "
+        "Example: --attack-hysteresis 40:0.2 covers a ~2 s commitment window.",
     )
     args = parser.parse_args()
     run(args)
