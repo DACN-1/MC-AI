@@ -151,6 +151,5 @@ llava_model_cache/
 caches/
 output/
 output_cluster/
-rollout_clip_indist/
-rollout_logs_*/
-eval_frame_raw*.png
+rollouts/
+debug/

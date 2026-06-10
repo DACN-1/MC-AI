@@ -6,7 +6,7 @@ behavioural cloning. The 11-bin mu-law camera quantizer originally from OpenAI
 VPT is vendored in `vpt_camera.py` — the upstream submodule is no longer part
 of the project.
 
-See [IMPLEMENTATION.md](IMPLEMENTATION.md) for the engineering reference.
+See [docs/IMPLEMENTATION.md](docs/IMPLEMENTATION.md) for the engineering reference.
 
 ## Quick Start
 
