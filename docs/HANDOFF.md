@@ -1,4 +1,26 @@
-# HANDOFF — 2026-06-09 update (canonical)
+# HANDOFF — 2026-06-10 update (canonical)
+
+## TL;DR — 2026-06-10 (camera-axis sweep: CLOSED, negative)
+
+The camera axis proposed in the 2026-06-09 TL;DR was swept (C1–C7, see
+`docs/trials.md` top section) and is **closed with a negative result**:
+
+- Camera *prediction* is already at the demo floor (mae 0.46°). Class
+  weights (`wloss`/`cwloss`) break the binary policy (dirt collapses to
+  0.00–1.67); scaling the camera CE (`camCE×2`) adds variance without mean
+  gains (3.33 / 9); decode-side `--camera-temperature 4.0` regresses dirt
+  (2.60). No intervention moved chop off reward=0.
+- **Verdict: chop failure is temporal/behavioral** — the per-step camera
+  prediction is right, but its use over time during chop attempts is wrong.
+  Do not spend more compute on camera-loss recipes.
+- SOTA confirmed stable: `slot30_chop3` = 4.60 dirt/ep (max 8).
+
+Next batch (see `~/.claude/plans/recipe-merry-fog.md` roadmap): decode
+sweeps on the SOTA ckpt (the exp2_thr trick was never run on it), temporal
+decode mechanisms in `run_rollout.py` (chunk ensembling / open-loop
+execute-k / attack hysteresis), wrapper re-evals of `r3b_lowDrop`/`slot50`,
+a knob-only compound-neighborhood cluster batch, and trainer selection infra
+(per-trajectory val split + keep-best checkpoint).
 
 > This is the single source of truth for picking up the project.
 > Older handoffs (`agent_handoff_2026-06-05.md`, `alignment_handoff_2026-06-04.md`,

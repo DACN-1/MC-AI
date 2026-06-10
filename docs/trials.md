@@ -1,4 +1,46 @@
-# Trials — head-only recipe sweep (2026-06-08/09)
+# Trials — head-only recipe sweeps
+
+## Camera-axis sweep (2026-06-09/10) — CLOSED, negative result
+
+Motivated by the chop-tasks-at-reward-0 problem: HANDOFF flagged "camera-aware
+training fix" as the next axis. Base recipe is `sc` = `slot30_chop3` (SOTA).
+All retrains on the same `clip_combined_lang_stride4` cache, 10 epochs,
+HIDDEN_DIM=2048. Quick screens were 3 eps (C4/C7); wloss cells got the full
+4-condition suite; C2 is decode-only (no retrain).
+
+| ID | Recipe | Knobs | C_chop_task | D_dirt_task (mean / max) |
+|----|--------|-------|-------------|--------------------------|
+| —  | `slot30_chop3` (SOTA ref) | — | 0 | **4.60 / 8** |
+| C1 | forced +20° pitch env | env variant, no retrain | n/a | n/a (apples only) |
+| C2 | `sc` + `--camera-temperature 4.0` | decode only | 0 | 2.60 / 4 |
+| C3 | `wloss` alone | `WEIGHTED_LOSS=1` | 0 | 0.00 / 0 |
+| C4 | `sc_camCE2x` | `CAM_CE_WEIGHT=2.0` | 0 | 3.33 / 9 (high variance) |
+| C5 | `sc_wloss` | sc + `WEIGHTED_LOSS=1` | 0 | 0.00 / 0 |
+| C7 | `sc_cwloss` | sc + `CAM_WEIGHTED_LOSS=1` | 0 | 1.67 / 3 |
+
+Checkpoints: `output/clip_combined_lang_stride4_{wloss,slot30_chop3_wloss,slot30_chop3_camCE2x,slot30_chop3_cwloss,cwloss}/`.
+Eval runs: `output/quick_C4_sc_camCE2x/`, `output/quick_C7_sc_cwloss/`,
+`output/c2_slot30_chop3_camtemp4/`, `output/evaluation/20260609_232536_wrap_wloss/`,
+`output/evaluation/20260610_003348_wrap_slot30_chop3_wloss/`.
+
+**Verdict:** the lang baseline's camera prediction is already near its loss
+floor (camera mae 0.46°, effectively the demo distribution's limit). Every
+camera-loss-side intervention either disrupts the binary policy (the wloss
+family collapses dirt to 0) or shifts variance up without improving the mean
+(camCE×2). No camera intervention helped chop. The unsolved chop tasks are
+NOT a "wrong camera prediction" problem — the per-step camera prediction is
+right, but the *use of camera over time* during chop attempts is wrong.
+That's a temporal/behavioral problem, not a loss-weighting one. **Do not
+spend more compute on camera-loss recipes.** Next axis: temporal decode
+mechanisms (chunk ensembling, open-loop execution, attack hysteresis).
+
+New knobs that landed with this sweep (all default-off / legacy-identical):
+`--cam-weighted-loss` (camera CE class weights without binary pos_weight),
+`--cam-ce-weight` (scales the camera CE term; default 0.5 = historical), and
+the matching `WEIGHTED_LOSS` / `CAM_WEIGHTED_LOSS` / `CAM_CE_WEIGHT` env vars
+in `slurm_train_nvidiaall.sh`.
+
+# Head-only recipe sweep (2026-06-08/09)
 
 Comprehensive log of every recipe tested in the 2026-06-08/09 head-only sweep
 on top of the `clip_combined_lang_stride4` cache (combined chop+dirt, stride 4,
@@ -130,5 +172,6 @@ time.
   `PAST_ACTION_SLOT_DROPOUT`, `CHOP_OVERSAMPLE_WEIGHT`. All default to "off",
   so existing recipes (R1/R2) keep producing the same output.
 - Camera-side recipes (different bin spacing, camera-aware loss weighting,
-  forced pitch start) were NOT tested this session — they're the next obvious
-  axis to attack the still-unsolved chop tasks.
+  forced pitch start) were NOT tested this session. UPDATE 2026-06-10: they
+  were tested in the follow-up camera-axis sweep (top of this file) and the
+  axis is now closed — negative result.
