@@ -247,6 +247,7 @@ def vla_loss(
     pos_weight: th.Tensor | None = None,
     cam_weight: th.Tensor | None = None,
     focal_gamma: float = 0.0,
+    cam_ce_weight: float = 0.5,
 ) -> tuple[th.Tensor, float, float]:
     """BCE on binary actions + cross-entropy on each camera axis, averaged over
     the chunk axis when present.
@@ -306,7 +307,7 @@ def vla_loss(
         )
     ce_x = nn.functional.cross_entropy(cam_x_logits, cam_x_targets, weight=cam_weight)
     ce_y = nn.functional.cross_entropy(cam_y_logits, cam_y_targets, weight=cam_weight)
-    cam_ce = 0.5 * (ce_x + ce_y)
+    cam_ce = cam_ce_weight * (ce_x + ce_y)
 
     return bce + cam_ce, bce.item(), cam_ce.item()
 
@@ -815,6 +816,8 @@ def train_cached_head(
     focal_gamma: float = 0.0,
     past_action_slot_dropout: float = 0.0,
     chop_oversample_weight: float = 1.0,
+    cam_weighted_loss: bool = False,
+    cam_ce_weight: float = 0.5,
 ):
     """Train an MLP head on precomputed backbone features.
 
@@ -846,14 +849,24 @@ def train_cached_head(
     )
 
     pos_weight = cam_weight = None
-    if weighted_loss:
-        pos_weight, cam_weight = compute_class_weights(dataset.targets_by_stem)
-        pos_weight = pos_weight.to(device)
-        cam_weight = cam_weight.to(device)
+    if weighted_loss or cam_weighted_loss:
+        # cam_weighted_loss: keep only the camera CE class weights, drop the
+        # binary BCE pos_weight. Tests whether the camera fix in isolation
+        # gives the F1 gains without disrupting the binary policy.
+        full_pos, full_cam = compute_class_weights(dataset.targets_by_stem)
+        if weighted_loss:
+            pos_weight = full_pos.to(device)
+        if weighted_loss or cam_weighted_loss:
+            cam_weight = full_cam.to(device)
+        bce_str = (
+            f"pos_weight[forward]={pos_weight[2]:.1f} "
+            f"pos_weight[attack]={pos_weight[0]:.2f}  "
+            if pos_weight is not None
+            else "pos_weight=OFF  "
+        )
         print(
-            f"Weighted loss ON — pos_weight[forward]={pos_weight[2]:.1f} "
-            f"pos_weight[attack]={pos_weight[0]:.2f}  cam_weight[0deg]={cam_weight[5]:.2f} "
-            f"cam_weight[max]={cam_weight.max():.1f}"
+            f"Weighted loss ON — {bce_str}"
+            f"cam_weight[0deg]={cam_weight[5]:.2f} cam_weight[max]={cam_weight.max():.1f}"
         )
     if history_dropout > 0:
         print(f"History dropout ON — p={history_dropout}")
@@ -992,6 +1005,8 @@ def train_cached_head(
                     "focal_gamma": focal_gamma,
                     "past_action_slot_dropout": past_action_slot_dropout,
                     "chop_oversample_weight": chop_oversample_weight,
+                    "cam_weighted_loss": cam_weighted_loss,
+                    "cam_ce_weight": cam_ce_weight,
                     "camera_quantizer": {
                         "camera_maxval": DEFAULT_CAMERA_QUANTIZER.camera_maxval,
                         "camera_binsize": DEFAULT_CAMERA_QUANTIZER.camera_binsize,
@@ -1020,7 +1035,8 @@ def train_cached_head(
             optim.zero_grad()
             logits = model(feats, pasts)
             loss, bce_v, cam_v = vla_loss(
-                logits, acts, pos_weight, cam_weight, focal_gamma=focal_gamma
+                logits, acts, pos_weight, cam_weight,
+                focal_gamma=focal_gamma, cam_ce_weight=cam_ce_weight,
             )
             loss.backward()
             optim.step()
@@ -1043,7 +1059,8 @@ def train_cached_head(
                 pasts = pasts.to(device)
                 logits = model(feats, pasts)
                 loss, bce_v, cam_v = vla_loss(
-                    logits, acts, pos_weight, cam_weight, focal_gamma=focal_gamma
+                    logits, acts, pos_weight, cam_weight,
+                    focal_gamma=focal_gamma, cam_ce_weight=cam_ce_weight,
                 )
                 val_total += loss.item()
                 val_bce += bce_v

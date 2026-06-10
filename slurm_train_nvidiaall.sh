@@ -68,6 +68,9 @@ LEARNABLE_BCE_TEMP="${LEARNABLE_BCE_TEMP:-0}"
 FOCAL_GAMMA="${FOCAL_GAMMA:-0.0}"
 PAST_ACTION_SLOT_DROPOUT="${PAST_ACTION_SLOT_DROPOUT:-0.0}"
 CHOP_OVERSAMPLE_WEIGHT="${CHOP_OVERSAMPLE_WEIGHT:-1.0}"
+WEIGHTED_LOSS="${WEIGHTED_LOSS:-0}"
+CAM_WEIGHTED_LOSS="${CAM_WEIGHTED_LOSS:-0}"
+CAM_CE_WEIGHT="${CAM_CE_WEIGHT:-0.5}"
 RECIPE_TAG="${RECIPE_TAG:-}"
 
 LANG_TAG=$([ "$USE_LANGUAGE" = "1" ] && echo lang || echo nolang)
@@ -155,6 +158,15 @@ if [ "$(echo "$PAST_ACTION_SLOT_DROPOUT > 0.0" | bc -l 2>/dev/null)" = "1" ]; th
 fi
 if [ "$(echo "$CHOP_OVERSAMPLE_WEIGHT != 1.0" | bc -l 2>/dev/null)" = "1" ]; then
     EXTRA_FLAGS+=("--chop-oversample-weight" "$CHOP_OVERSAMPLE_WEIGHT")
+fi
+if [ "$WEIGHTED_LOSS" = "1" ]; then
+    EXTRA_FLAGS+=("--weighted-loss")
+fi
+if [ "$CAM_WEIGHTED_LOSS" = "1" ]; then
+    EXTRA_FLAGS+=("--cam-weighted-loss")
+fi
+if [ "$(echo "$CAM_CE_WEIGHT != 0.5" | bc -l 2>/dev/null)" = "1" ]; then
+    EXTRA_FLAGS+=("--cam-ce-weight" "$CAM_CE_WEIGHT")
 fi
 
 # ---------- run ------------------------------------------------------------

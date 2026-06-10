@@ -262,6 +262,24 @@ def main():
         "with --frame-weight-multiplier. Cache-safe.",
     )
     parser.add_argument(
+        "--cam-weighted-loss",
+        action="store_true",
+        help="Enable ONLY the camera CE class weights (cam_weight), NOT the "
+        "binary BCE pos_weight. Decoupled from --weighted-loss; lets the "
+        "camera fix be tested in isolation without disrupting the binary "
+        "policy. Use when --weighted-loss broke things at inference.",
+    )
+    parser.add_argument(
+        "--cam-ce-weight",
+        type=float,
+        default=0.5,
+        help="Coefficient on the camera CE contribution to the total loss: "
+        "loss = bce + cam_ce_weight * (ce_x + ce_y). Default 0.5 = "
+        "historical average behavior. 1.0 doubles camera emphasis; 2.0 "
+        "quadruples it. Different from --cam-weighted-loss (class weights) "
+        "— this just scales the camera vs binary tradeoff.",
+    )
+    parser.add_argument(
         "--end-to-end",
         action="store_true",
         help="Skip caching; train backbone+head end-to-end (legacy path).",
@@ -388,6 +406,8 @@ def main():
                 focal_gamma=args.focal_gamma,
                 past_action_slot_dropout=args.past_action_slot_dropout,
                 chop_oversample_weight=args.chop_oversample_weight,
+                cam_weighted_loss=args.cam_weighted_loss,
+                cam_ce_weight=args.cam_ce_weight,
             )
         else:
             from feature_cache import CachedFeatureDataset, HeadOnlyAgent
