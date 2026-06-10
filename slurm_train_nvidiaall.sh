@@ -115,6 +115,12 @@ else
     fi
 fi
 
+# Videos are only needed when the cache must be BUILT. Head-only retrains on
+# an existing cache read features from the memmap and targets/past-actions
+# from all_actions.json — the MP4s were deleted from BIG on 2026-06-10 to
+# make room for the LLaVA caches, so don't require them when the cache for
+# this cell already exists.
+EXPECTED_CACHE="$CACHE_DIR/${BACKBONE}_${TASK_TAG}_${LANG_TAG}${STRIDE_TAG}.npy"
 for TASK in "${STAGE_TASKS[@]}"; do
     TRAJ_SUBDIR="$DATA_DIR/trajectory_task_${TASK}_length_3000"
     ACTIONS_JSON="$TRAJ_SUBDIR/all_actions.json"
@@ -125,8 +131,18 @@ for TASK in "${STAGE_TASKS[@]}"; do
     n_stems=$(python -c "import json; print(len(json.load(open('$ACTIONS_JSON'))))")
     n_videos=$(find "$TRAJ_SUBDIR/videos" -maxdepth 1 -name 'video_*.mp4' 2>/dev/null | wc -l | tr -d ' ')
     echo "Stage check  $TASK: stems=$n_stems videos=$n_videos"
-    if [ "$n_stems" -eq 0 ] || [ "$n_videos" -eq 0 ]; then
-        echo "ERROR: trajectory_task_${TASK} has stems=$n_stems videos=$n_videos" >&2
+    if [ "$n_stems" -eq 0 ]; then
+        echo "ERROR: trajectory_task_${TASK} has stems=0" >&2
+        exit 1
+    fi
+    if [ -s "$EXPECTED_CACHE" ]; then
+        if [ "$n_videos" -eq 0 ]; then
+            echo "  (videos absent — OK, cache $(basename "$EXPECTED_CACHE") already built)"
+        fi
+        continue
+    fi
+    if [ "$n_videos" -eq 0 ]; then
+        echo "ERROR: trajectory_task_${TASK} has videos=0 and no cache at $EXPECTED_CACHE — cache build needs MP4s" >&2
         exit 1
     fi
     if [ "$n_videos" -lt "$(( n_stems * 95 / 100 ))" ]; then
