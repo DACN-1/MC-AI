@@ -4,8 +4,14 @@
 # Blackwell needs torch >= 2.7 + CUDA 12.8 (cu128) — the cluster's pinned
 # torch 2.4 / flash-attn wheel has no sm_120 kernel. This installs the additive
 # Blackwell path (requirements-blackwell.txt), deliberately WITHOUT flash-attn:
-# VLAAgent falls back to sdpa attention, numerically equivalent modulo fp16
-# reduction order. fp16 is kept so 5090-built caches stay mergeable with A5000.
+# VLAAgent falls back to sdpa attention.
+#
+# Compute dtype: VLAAgent auto-defaults to bf16 on sm_120 (override via
+# R1VA_LLAVA_DTYPE). bf16's wider exponent stabilises sdpa softmax at the
+# 32-batch+ regime where fp16 used to clip — that ~2x speedup over the prior
+# fp16+batch-24 setup. Cache storage stays fp16 (feature_cache.py:324), so
+# 5090 bf16 builds remain shape-mergeable with A5000 fp16 builds; per-feature
+# drift is ~3rd-decimal noise and not material for the downstream BC head.
 #
 # Works on the vast.ai "PyTorch (Vast)" or "NVIDIA CUDA" templates (or any
 # CUDA base whose driver reports Max CUDA >= 12.8 — pip's cu128 torch wheels
@@ -99,4 +105,5 @@ PY
 echo
 echo "Setup OK. Next: probe throughput before the real run, e.g."
 echo "  $PY scripts/probe_5090_throughput.py --data-dir ./trajectories \\"
-echo "      --backbone llava --use-language --batch-size 24 --price 0.802"
+echo "      --backbone llava --use-language --batch-size 32 --price 0.802"
+echo "  (bf16 is the default on sm_120; add --compute-dtype fp16 to A/B against legacy)"

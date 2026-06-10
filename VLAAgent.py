@@ -7,6 +7,8 @@ of `output_dim` is owned by `constants.py` and `action_mapping.py` — see
 `NUM_OUTPUT_LOGITS` there for the binary / camera-bin layout.
 """
 
+import os
+
 import torch as th
 from torch import nn
 from transformers import (
@@ -24,39 +26,45 @@ class VLAAgent(nn.Module):
         past_action_dim: int = 0,
         chunk_size: int = 1,
         head_hidden_dim: int | None = None,
+        compute_dtype: th.dtype | None = None,
     ):
         super().__init__()
         self.processor = LlavaProcessor.from_pretrained(backbone)
-        # FlashAttention-2 cuts both prefill time and the quadratic attention
-        # activation tensor. Combined with the hidden-state hook in encode(),
-        # this is what lets the LLaVA cache build run at batch=64+ on a 24 GB
-        # A5000. Fall back to sdpa on platforms without the flash-attn wheel
-        # (e.g. the macOS dev machine) — the encode output is numerically the
-        # same modulo standard fp16 reduction-order differences.
-        # FA2 must be initialised on the GPU directly. `from_pretrained` first
-        # places the model on CPU and then HF silently falls back to eager
-        # attention if it sees CPU placement at init time — so a later
-        # `.to("cuda")` does not re-enable FA2. Pass `device_map="cuda"` here
-        # to skip the CPU staging step. On macOS (no CUDA) fall back to the
-        # default CPU placement + sdpa attention.
-        # On Blackwell (RTX 5090, sm_120) there is no flash-attn wheel — stock
-        # flash-attn has no sm_120 kernel — so we run on sdpa there by design.
-        # With flash_attn absent, HF raises ImportError (CPU-only → ValueError),
-        # both caught below. If a dirty base image ships a stock flash-attn whose
-        # kernel rejects sm_120, the failure surfaces as a RuntimeError at load —
-        # caught too, so the sdpa retry still fires.
+        # Compute dtype: bf16 on CUDA by default — target hardware is RTX 5090
+        # (sm_120, no FA2). bf16's wider exponent keeps the sdpa softmax stable
+        # at batch ~32 where fp16 used to clip, which is the ~2x throughput we
+        # need without FA2. Output features are still cast to fp16 at the
+        # storage boundary (feature_cache.py), so the on-disk format is
+        # unchanged. Override via R1VA_LLAVA_DTYPE={fp16,bf16} or the
+        # compute_dtype kwarg. CPU stays fp16 (bf16 cpu kernels are slow/limited).
+        if compute_dtype is None:
+            env = os.environ.get("R1VA_LLAVA_DTYPE", "").lower()
+            if env in {"fp16", "float16", "half"}:
+                compute_dtype = th.float16
+            elif env in {"bf16", "bfloat16"}:
+                compute_dtype = th.bfloat16
+            else:
+                compute_dtype = th.bfloat16 if th.cuda.is_available() else th.float16
+        self._compute_dtype = compute_dtype
+        # No FA2 on Blackwell (stock flash-attn has no sm_120 kernel) — VLAAgent
+        # runs on sdpa attention there by design. The except below catches both
+        # the missing-package ImportError (CPU-only or 5090 box) and the
+        # RuntimeError a dirty base image throws when shipping a sm_120-
+        # incompatible flash-attn binary. The FA2 try-branch is kept so any
+        # legacy Ampere/Ada machine that still has flash-attn installed picks
+        # it up automatically.
         cuda_available = th.cuda.is_available()
         try:
             self.llava = LlavaForConditionalGeneration.from_pretrained(
                 backbone,
-                torch_dtype=th.float16,
+                torch_dtype=compute_dtype,
                 attn_implementation="flash_attention_2",
                 device_map="cuda" if cuda_available else None,
             )
         except (ImportError, ValueError, RuntimeError):
             self.llava = LlavaForConditionalGeneration.from_pretrained(
                 backbone,
-                torch_dtype=th.float16,
+                torch_dtype=compute_dtype,
                 device_map="cuda" if cuda_available else None,
             )
         # Freeze backbone
@@ -96,7 +104,7 @@ class VLAAgent(nn.Module):
     def feature_dim(self) -> int:
         """Width of the pooled LLaVA feature consumed by the head (pre past-action).
 
-        After the split-image/text pooling fix (`docs/alignment_handoff.md`
+        After the split-image/text pooling fix (`docs/_archive/alignment_handoff_2026-06-04.md`
         Phase C step 2) this is 2 * llava_hidden_size = 8192 for LLaVA-1.5-7B.
         """
         return self._feature_dim
@@ -116,7 +124,7 @@ class VLAAgent(nn.Module):
         ``image_seq_length`` (=576) tokens at forward time, the joint mean
         was dominated by image tokens (~576) versus a handful of text tokens
         (~5), washing out the language signal entirely. See
-        ``docs/alignment_handoff.md`` for the full diagnostic.
+        ``docs/_archive/alignment_handoff_2026-06-04.md`` for the full diagnostic.
 
         ``use_language=False`` zeros ``text_pool`` after pooling — matching
         ``frozen_vision_baseline.py``'s zero-text-features behavior. We do NOT

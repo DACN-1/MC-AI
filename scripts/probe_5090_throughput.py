@@ -55,17 +55,27 @@ def main() -> None:
     lang.add_argument("--no-language", dest="use_language", action="store_false")
     p.set_defaults(use_language=True)
     p.add_argument("--llava-id", default="llava-hf/llava-1.5-7b-hf")
-    p.add_argument("--batch-size", type=int, default=24,
-                   help="start at 24 on a 32GB 5090 (no FA2); bisect up/down on nvidia-smi")
+    p.add_argument("--batch-size", type=int, default=32,
+                   help="start at 32 on Blackwell+bf16 (was 24 in the fp16 era); "
+                        "bisect up to 48/64 if nvidia-smi shows room, down to 24/16 on OOM")
     p.add_argument("--num-frames", type=int, default=480,
                    help="frames to time over (after warmup)")
     p.add_argument("--warmup-batches", type=int, default=2,
                    help="batches to run untimed first (GPU warmup / lazy init)")
     p.add_argument("--device", default="cuda" if th.cuda.is_available() else "cpu")
+    p.add_argument("--compute-dtype", choices=["fp16", "bf16"], default=None,
+                   help="LLaVA backbone compute dtype; default bf16 on Blackwell (better "
+                        "sdpa stability → bigger batches), fp16 elsewhere. Sets "
+                        "R1VA_LLAVA_DTYPE which VLAAgent reads.")
     p.add_argument("--price", type=float, default=0.686, help="rental $/hr for the cost estimate")
     p.add_argument("--full-samples", type=int, default=DEFAULT_FULL_SAMPLES,
                    help="samples in one full cache (per backbone x lang condition)")
     args = p.parse_args()
+
+    if args.compute_dtype is not None:
+        import os
+
+        os.environ["R1VA_LLAVA_DTYPE"] = args.compute_dtype
 
     if args.device == "cuda":
         if not th.cuda.is_available():
@@ -74,7 +84,9 @@ def main() -> None:
         print(f"GPU: {th.cuda.get_device_name(0)}  sm_{cap[0]}{cap[1]}  "
               f"torch {th.__version__} (cuda {th.version.cuda})")
         if cap[0] >= 12:
-            print("  -> Blackwell (sm_120): running on sdpa attention by design (no flash-attn).")
+            print("  -> Blackwell (sm_120): sdpa attention (no flash-attn wheel for sm_120). "
+                  "VLAAgent defaults to bf16 here to keep sdpa numerically stable at the "
+                  "32-batch+ regime; storage is still fp16 so caches stay shape-mergeable.")
 
     try:
         from decord import VideoReader

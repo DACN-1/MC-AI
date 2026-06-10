@@ -18,9 +18,14 @@
 #      attention when flash_attn is absent — numerically equivalent modulo fp16
 #      reduction order. Do not `pip install flash-attn` on this box.
 #
-# fp16 is kept everywhere (NOT bf16): the feature cache is stored as np.float16,
-# so caches built on the 5090 stay numerically mergeable with A5000-built caches
-# for the combined-dataset ablation. Do not switch the backbone to bf16.
+# Compute dtype: VLAAgent defaults to bf16 on Blackwell (sm_120), fp16 on
+# Ampere/Ada — see VLAAgent.py compute_dtype selection. bf16's wider exponent
+# keeps the no-FA2 sdpa softmax stable at larger batches, so the 5090 path
+# pushes batch ~32 instead of the old fp16 batch-24 limit. Storage is still
+# unconditionally fp16 (feature_cache.py:324), so caches stay shape-mergeable
+# across A5000 fp16 and 5090 bf16 builds — per-feature drift is ~3rd-decimal
+# noise vs an A5000 fp16 build and not material for the downstream BC head.
+# Override either default with R1VA_LLAVA_DTYPE={fp16,bf16}.
 #
 # Python 3.12 (cp312) is required — same as requirements.txt — because numpy<2
 # and the rest of the stack were validated there. Use a 3.12 venv or a 3.12

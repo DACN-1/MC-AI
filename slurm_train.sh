@@ -1,4 +1,9 @@
 #!/bin/bash
+# DEPRECATED 2026-06-06: the Abaki QOS was revoked for the stud_ifi association,
+# so this script can no longer be submitted in its current form. Use the rented
+# RTX 5090 workflow (scripts/setup_vastai_5090.sh + cluster_pipeline.py) for new
+# cache builds. Kept for reference + in case QOS gets restored; for any CIP
+# fallback that can't go on a rented box, prefer slurm_train_nvidiaall.sh.
 #SBATCH --job-name=vla_train
 #SBATCH --partition=Abaki
 # QOS: the `abaki` QOS is no longer in the stud_ifi association (submitting with
@@ -69,7 +74,7 @@ FRAME_STRIDE="${FRAME_STRIDE:-1}"
 # Pin a single head hidden width across all 4 ablation cells so the head-
 # capacity asymmetry between CLIP (feature_dim=1536) and LLaVA (feature_dim=
 # 8192 after split-pool) doesn't confound the backbone comparison — see
-# docs/alignment_handoff.md Phase C Step 1.
+# docs/_archive/alignment_handoff_2026-06-04.md Phase C Step 1.
 HIDDEN_DIM="${HIDDEN_DIM:-2048}"
 
 LANG_TAG=$([ "$USE_LANGUAGE" = "1" ] && echo lang || echo nolang)

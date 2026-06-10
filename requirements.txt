@@ -1,4 +1,11 @@
-# VLA Action Head Training Requirements
+# VLA Action Head Training Requirements — LEGACY A5000 / NvidiaAll path.
+#
+# DEPRECATED 2026-06-06: Abaki QOS was revoked for the stud_ifi association.
+# Primary stack is now requirements-blackwell.txt (rented RTX 5090, sm_120,
+# torch 2.7 + cu128, no flash-attn). This file is retained for the
+# NvidiaAll fallback on LMU CIP (Turing/Ada, where torch 2.4 + the stock FA2
+# wheel still resolve) and as a reference for any A5000 box that comes back.
+#
 # Tested with Python 3.12 on the LMU CIP Abaki cluster (RTX A5000, 24 GB).
 # (Python 3.10 not available on LMU CIP; 3.11 lacks the python3.11-venv apt
 #  package and we don't have root — so 3.12 it is, which forces torch>=2.2.)

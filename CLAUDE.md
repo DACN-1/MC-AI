@@ -164,21 +164,23 @@ train_cached_head(
 )"
 ```
 
-One cache pass costs ~26 h per LLaVA tag / ~6 h per CLIP tag on A5000; all 8
-head-training runs together fit in a few hours. See "Compute budget" below.
+One cache pass costs ~25 h per LLaVA tag / ~6 h per CLIP tag on a rented 5090
+(bf16 + sdpa + batch 32, no FA2); all 8 head-training runs together fit in a
+few hours. See "Compute budget" below.
 
-### 2c. Cache build on a rented RTX 5090 (Blackwell / sm_120)
+### 2c. Cache build on a rented RTX 5090 (Blackwell / sm_120) — primary path
 
-Renting a 5090 on vast.ai is the cheapest way to run the cache build (best
-DLP/$). Blackwell needs a *different* stack than the cluster, so there are two
-install paths — pick by hardware:
-
-- **A5000 cluster** — `requirements.txt` (torch 2.4 + the pinned FlashAttention-2
-  wheel). Unchanged; FA2 enables batch=64 cache builds on 24 GB.
-- **RTX 5090 / Blackwell** — `requirements-blackwell.txt` + torch 2.7 from the
-  cu128 index. **No flash-attn** (stock FA2 has no sm_120 kernel); `VLAAgent`
-  falls back to sdpa, numerically equivalent modulo fp16 reduction order. fp16
-  is kept (not bf16) so 5090-built caches stay mergeable with A5000 caches.
+The Abaki A5000 cluster is no longer available (QOS was revoked for
+`stud_ifi`). All paper-grade cache builds run on a rented vast.ai 5090
+instead. Use `requirements-blackwell.txt` + torch 2.7 from the cu128 index
+(torch 2.7 is the first release shipping cu128 / sm_120 wheels). **No
+flash-attn** (stock FA2 has no sm_120 kernel) — `VLAAgent` runs on sdpa.
+`VLAAgent` defaults to **bf16** on CUDA — wider exponent keeps sdpa softmax
+stable at the 32-batch regime, which is the ~2x throughput we need without
+FA2. Storage stays fp16 (`feature_cache.py:324`) so the on-disk format is
+identical to historical A5000 fp16 caches; per-feature numerical drift is
+~3rd-decimal noise. Override the dtype default via env
+`R1VA_LLAVA_DTYPE={fp16,bf16}` or `VLAAgent(compute_dtype=…)`.
 
 ```bash
 # On the rented box (idempotent): venv + cu128 torch + deps + verify.
@@ -187,12 +189,54 @@ bash scripts/setup_vastai_5090.sh
 # ALWAYS probe throughput before committing a multi-day rental — it prints
 # samples/sec and an extrapolated full-run $ cost from real numbers.
 python scripts/probe_5090_throughput.py --data-dir ./trajectories \
-    --backbone llava --use-language --batch-size 24 --price 0.686
+    --backbone llava --use-language --batch-size 32 --price 0.686
+# Add --compute-dtype fp16 to A/B against the legacy fp16 path.
 ```
 
-Without FA2, sdpa uses more attention-activation memory, so the 5090's 32 GB
-does *not* buy the A5000's headroom. Start `cache_batch_size`/`--batch-size` at
-**24**; bisect up (28/32) if `nvidia-smi` shows room, down (16) on OOM.
+Start `cache_batch_size`/`--batch-size` at **32** (the new default in
+`cluster_pipeline.py` and `feature_cache.precompute`); bisect up (40/48/64)
+if `nvidia-smi` shows room, down to 24/16 on OOM.
+
+#### Full runbook: Phase C LLaVA stride-4 on a rented 5090
+
+End-to-end orchestration is split into two scripts so the user is in the loop
+between renting (paid action) and launching:
+
+1. **Rent a 5090** via the vast.ai web console or `vastai create instance`.
+   Filter offers with `gpu_name=RTX_5090 reliability>=0.97 inet_down>=400
+   disk_space>=200`. Cheapest spot is ~$0.51/hr as of 2026-06.
+2. **Add your cluster SSH pubkey** to the box's `~/.ssh/authorized_keys` (web
+   console) so the cluster can rsync data over.
+3. **From the LMU cluster login node**, push trajectories + code:
+   ```bash
+   bash ~/BIG/scripts/push_data_to_5090.sh <ssh_host> <ssh_port>
+   ```
+   ~120 GB at ~50 MB/s cluster outbound ≈ 40 min, ≈ $1.92 in vast.ai inbound
+   bandwidth charges.
+4. **SSH into the box** and launch the build:
+   ```bash
+   ssh -p <ssh_port> root@<ssh_host>
+   cd /workspace/r1-va && bash scripts/launch_5090_phase_c.sh
+   ```
+   The script verifies the GPU/torch stack, validates staged data, probes
+   throughput for ~5 min, then builds both stride-4 LLaVA caches and trains
+   both heads. Total ~14 h ≈ $7.20 in compute.
+5. **Pull outputs back** from your Mac (or cluster login node):
+   ```bash
+   rsync -avz --progress -P -p <ssh_port> \
+       root@<ssh_host>:/workspace/{caches,output}/ ~/BIG/
+   ```
+
+End-to-end cost target: **~$10** (compute $7.18 + upload $1.92 + download $0.43
++ storage $0.08). Top up vast.ai by ~$5 first; the $9.18 starter credit is
+$0.40 short of completion.
+
+#### Legacy: A5000 (deprecated)
+
+`requirements.txt` (torch 2.4 + pinned FA2 wheel) and `slurm_train.sh` were
+the A5000/Abaki path. They still work if QOS is restored, but the canonical
+target is the 5090 path above. The cluster comment in `slurm_train.sh`
+documents the QOS revocation.
 
 ### 3. Roll out a trained agent in MineRL
 ```bash
@@ -204,38 +248,27 @@ python run_rollout.py \
     --record-video
 ```
 
-### 4. SLURM (one job per ablation cell — LMU CIP Abaki partition)
+### 4. SLURM on LMU CIP (legacy — Abaki partition no longer accessible)
 
-`slurm_train.sh` runs `cluster_pipeline.py` for one (backbone × task × language)
-cell on the `Abaki` partition (RTX A5000 24 GB). Selectors come from env vars.
-The script stages tarballs from `~/BIG/trajectories` onto the compute node's
-`/var/tmp1` and points the cache there too. The first job for a given cell
-builds the cache (~26 h LLaVA, ~6 h CLIP); subsequent jobs on the same node
-reuse it and finish in ~30 min — until the next weekly reboot wipes
-`/var/tmp1`, at which point `feature_cache.precompute` resumes from the
-recorded cursor.
+`slurm_train.sh` is the legacy A5000/Abaki entry point and `slurm_train_nvidiaall.sh`
+is the NvidiaAll variant. Both are kept for reference and for any CLIP runs
+the rented-5090 budget can't absorb, but the canonical target is now the
+**rented 5090** path (workflow 2c). Submission boilerplate, env-var contract,
+and output layout are unchanged from before:
 
 ```bash
-# One-time on the cluster:
+# Cluster venv setup (one-time, pre-Blackwell-migration; kept for the
+# NvidiaAll variant — A5000 path requires abaki QOS which is currently revoked):
 python3.11 -m venv ~/BIG/.venv
 source ~/BIG/.venv/bin/activate
 pip install -r ~/BIG/requirements.txt
-bash ~/BIG/download_llava.sh   # optional: pre-warm HF cache
 
-# Build cache + train one cell (LLaVA + chop_a_tree + prompt)
-BACKBONE=llava TASK_FILTER=chop_a_tree USE_LANGUAGE=1 sbatch slurm_train.sh
-
-# All 8 cells of the 2x2 x 2 tasks ablation:
-for backbone in llava clip; do
-  for task in chop_a_tree collect_dirt; do
-    for lang in 1 0; do
-      BACKBONE=$backbone TASK_FILTER=$task USE_LANGUAGE=$lang sbatch slurm_train.sh
-    done
-  done
-done
+# Submit one cell (NvidiaAll variant; replace USE_LANGUAGE/FRAME_STRIDE/etc.):
+BACKBONE=clip USE_LANGUAGE=1 FRAME_STRIDE=4 HIDDEN_DIM=2048 TASK_FILTER="" \
+  sbatch slurm_train_nvidiaall.sh
 ```
 
-Output is auto-tagged: `~/BIG/output/<backbone>_<task>_<lang|nolang>/{model.pt, metrics.json}`.
+Output is auto-tagged: `~/BIG/output/<backbone>_<task>_<lang|nolang>[_strideN]/{model.pt, metrics.json}`.
 
 ### 5. MineRL inside Docker (Apple Silicon-friendly)
 ```bash
@@ -342,31 +375,36 @@ node reboot) without manual intervention.
 ## Compute budget
 
 For the 2×2 ablation (LLaVA/CLIP × language on/off) on both tasks with the
-full temporal recipe (past-action K=8, chunk N=8), 10 epochs each:
+full temporal recipe (past-action K=8, chunk N=8), 10 epochs each.
+Per-sample times below are estimates for **RTX 5090 (Blackwell, sm_120)** —
+the new canonical hardware — with `VLAAgent` running bf16 + sdpa + batch 32
+(no FA2 on sm_120). Measure with `scripts/probe_5090_throughput.py` before
+committing a long rental.
+
+End-to-end (no cache):
 
 |                  | Per-sample fwd | Per epoch / task | All 8 runs |
 |------------------|---------------:|-----------------:|-----------:|
-| End-to-end LLaVA |          ~30 ms |             26 h |     ~520 h |
-| End-to-end CLIP  |           ~7 ms |              6 h |     ~120 h |
-| **Total end-to-end (1 task)** |     |              | **~640 h** |
-| **Total end-to-end (2 tasks)** |    |              | **~1280 h (~53 days)** |
+| End-to-end LLaVA |          ~15 ms |             13 h |     ~260 h |
+| End-to-end CLIP  |          ~3.5 ms |              3 h |      ~60 h |
 
-With `feature_cache.precompute` running first:
+With `feature_cache.precompute` first (the path you actually want):
 
-|                       | One-time cache build | Head training (10 ep) |
-|-----------------------|---------------------:|----------------------:|
-| 4 LLaVA caches × 26 h |               ~104 h |                  ~2 h |
-| 4 CLIP caches × 6 h   |                ~24 h |                  ~2 h |
-| **Total with caching, 2 tasks** | **~128 h (~5.3 days)** | **~4 h** |
+|                                 | One-time cache build | Head training (10 ep) |
+|---------------------------------|---------------------:|----------------------:|
+| 4 LLaVA caches × 25 h (stride 1)|                ~100 h |                 ~2 h |
+| 4 CLIP caches × 6 h (stride 1)  |                 ~24 h |                 ~2 h |
+| **Total with caching, 2 tasks** | **~124 h (~5.2 days)** | **~4 h** |
 
-Cache storage: ~25 GB per LLaVA tag (FP16 × 4096 dims) + ~10 GB per CLIP tag
-(FP16 × ~1536 dims) ≈ **140 GB total** — fits `/var/tmp1` (1 TB on the 1N
-nodes, 2 TB on the 2N nodes) easily. The cache wipes on weekly reboot;
-`feature_cache.precompute`'s atomic progress sidecar resumes the rebuild from
-the last batch.
+For stride 4 production cells (chosen for the in-flight CLIP ablation when
+disk is tight), divide each cache-build column by ~4. At vast.ai 5090 spot
+prices of ~$0.70/h, the full 8-cache stride-1 build is **~$90**.
 
-Per-sample times are public-benchmark estimates for A5000 + FP16; expect
-±50%. Measure on one mini-run before committing.
+Cache storage: ~50 GB per LLaVA stride-1 tag (FP16 × 8192 dims × 6.24 M
+samples) + ~10 GB per CLIP stride-1 tag (FP16 × 1536 dims) ≈ **240 GB total
+across all 8 caches** for stride 1. Stride 4 cuts each by ~4×. The vast.ai
+box typically has plenty of local disk; on LMU `~/BIG` (144 GB BIG quota)
+plan stride 4 instead.
 
 ## Tests
 
