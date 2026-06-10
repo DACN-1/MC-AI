@@ -787,6 +787,57 @@ def train_vla(
 # ---------------------------------------------------------------------
 # Cached-feature training (used after `feature_cache.precompute`)
 # ---------------------------------------------------------------------
+def split_indices_by_stem(
+    samples: list[tuple[str, int]],
+    val_split: float,
+    test_split: float,
+    seed: int = 42,
+) -> tuple[list[int], list[int], list[int]]:
+    """Group-aware split: every sample of a trajectory stem lands in exactly
+    one of (train, val, test).
+
+    The frame-level `random_split` this replaces leaked temporally adjacent,
+    near-identical frames of the same video into train AND val, so val
+    metrics were optimistic and noisy — bad for exactly the best-epoch
+    selection they're used for. Stems are shuffled deterministically
+    (`seed`), then assigned to test until its sample budget is met, then to
+    val, remainder to train, so the realized fractions track the requested
+    ones as closely as whole-trajectory granularity allows.
+
+    Returns (train_indices, val_indices, test_indices) into `samples`.
+    """
+    counts: dict[str, int] = {}
+    for stem, _ in samples:
+        counts[stem] = counts.get(stem, 0) + 1
+    stems = sorted(counts)
+    rng = np.random.RandomState(seed)
+    rng.shuffle(stems)
+
+    n_total = len(samples)
+    test_target = n_total * test_split
+    val_target = n_total * val_split
+    test_stems: set[str] = set()
+    val_stems: set[str] = set()
+    test_seen = val_seen = 0
+    for stem in stems:
+        if test_seen < test_target:
+            test_stems.add(stem)
+            test_seen += counts[stem]
+        elif val_seen < val_target:
+            val_stems.add(stem)
+            val_seen += counts[stem]
+
+    train_idx, val_idx, test_idx = [], [], []
+    for i, (stem, _) in enumerate(samples):
+        if stem in test_stems:
+            test_idx.append(i)
+        elif stem in val_stems:
+            val_idx.append(i)
+        else:
+            train_idx.append(i)
+    return train_idx, val_idx, test_idx
+
+
 def _cached_collate(batch):
     feats, targets, pasts = zip(*batch)
     return th.stack(feats), th.stack(targets), th.stack(pasts)
@@ -818,6 +869,8 @@ def train_cached_head(
     chop_oversample_weight: float = 1.0,
     cam_weighted_loss: bool = False,
     cam_ce_weight: float = 0.5,
+    split_by_trajectory: bool = True,
+    keep_best: bool = False,
 ):
     """Train an MLP head on precomputed backbone features.
 
@@ -871,14 +924,30 @@ def train_cached_head(
     if history_dropout > 0:
         print(f"History dropout ON — p={history_dropout}")
 
-    test_size = int(len(dataset) * test_split)
-    val_size = int(len(dataset) * val_split)
-    train_size = len(dataset) - val_size - test_size
-    train_set, val_set, test_set = random_split(
-        dataset,
-        [train_size, val_size, test_size],
-        generator=th.Generator().manual_seed(42),
-    )
+    if split_by_trajectory:
+        train_idx, val_idx, test_idx = split_indices_by_stem(
+            dataset.samples, val_split, test_split, seed=42
+        )
+        train_set = th.utils.data.Subset(dataset, train_idx)
+        val_set = th.utils.data.Subset(dataset, val_idx)
+        test_set = th.utils.data.Subset(dataset, test_idx)
+        n_stems = len({s for s, _ in dataset.samples})
+        print(
+            f"Trajectory-level split — {n_stems} stems; "
+            f"train={len(train_set):,} val={len(val_set):,} test={len(test_set):,}"
+        )
+    else:
+        # Legacy frame-level split: leaks adjacent frames train<->val (val
+        # metrics optimistic + noisy); kept only for comparability with
+        # pre-2026-06-10 checkpoints.
+        test_size = int(len(dataset) * test_split)
+        val_size = int(len(dataset) * val_split)
+        train_size = len(dataset) - val_size - test_size
+        train_set, val_set, test_set = random_split(
+            dataset,
+            [train_size, val_size, test_size],
+            generator=th.Generator().manual_seed(42),
+        )
 
     out_path = Path(out_weights)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1007,6 +1076,8 @@ def train_cached_head(
                     "chop_oversample_weight": chop_oversample_weight,
                     "cam_weighted_loss": cam_weighted_loss,
                     "cam_ce_weight": cam_ce_weight,
+                    "split_by_trajectory": split_by_trajectory,
+                    "keep_best": keep_best,
                     "camera_quantizer": {
                         "camera_maxval": DEFAULT_CAMERA_QUANTIZER.camera_maxval,
                         "camera_binsize": DEFAULT_CAMERA_QUANTIZER.camera_binsize,
@@ -1016,6 +1087,19 @@ def train_cached_head(
             },
             out_weights,
         )
+
+    # Keep-best: snapshot the epoch with the highest val movement-F1 to
+    # model_best.pt next to the rolling last-epoch checkpoint. Motivated by
+    # the ep10-vs-ep20 finding (docs/trials.md): more epochs helps some
+    # recipes and collapses others, so "last epoch wins" leaves performance
+    # on the table either way. Movement keys are where recipes actually
+    # differ — attack F1 saturates at ~.96 for every recipe.
+    best_path = out_path.with_name(out_path.stem + "_best" + out_path.suffix)
+    movement_idx = th.tensor(
+        [BINARY_ACTION_KEYS.index(k)
+         for k in ("back", "forward", "jump", "left", "right", "sprint")]
+    )
+    best_movement_f1 = max(history.get("val_movement_f1") or [float("-inf")])
 
     if start_epoch >= epochs:
         print(f"Already trained for {start_epoch} epochs >= requested {epochs}; nothing to do.")
@@ -1052,6 +1136,9 @@ def train_cached_head(
         val_total = val_bce = val_cam = 0.0
         binary_correct = binary_seen = 0
         cam_correct = cam_seen = 0
+        tp = th.zeros(NUM_BINARY, device=device)
+        fp = th.zeros(NUM_BINARY, device=device)
+        fn = th.zeros(NUM_BINARY, device=device)
         with th.no_grad():
             for feats, acts, pasts in val_loader:
                 feats = feats.to(device)
@@ -1068,8 +1155,12 @@ def train_cached_head(
                 logits_flat = logits.reshape(-1, logits.size(-1))
                 acts_flat = acts.reshape(-1, acts.size(-1))
                 preds = (th.sigmoid(logits_flat[:, :NUM_BINARY]) > 0.5).float()
-                binary_correct += (preds == acts_flat[:, :NUM_BINARY]).sum().item()
+                bin_targets = acts_flat[:, :NUM_BINARY]
+                binary_correct += (preds == bin_targets).sum().item()
                 binary_seen += preds.numel()
+                tp += (preds * bin_targets).sum(dim=0)
+                fp += (preds * (1.0 - bin_targets)).sum(dim=0)
+                fn += ((1.0 - preds) * bin_targets).sum(dim=0)
                 cam_x_pred = logits_flat[:, _CAM_X_SLICE].argmax(dim=-1)
                 cam_y_pred = logits_flat[:, _CAM_Y_SLICE].argmax(dim=-1)
                 cam_correct += (cam_x_pred == acts_flat[:, NUM_BINARY].long()).sum().item()
@@ -1082,14 +1173,29 @@ def train_cached_head(
         history["val_binary_acc"].append(binary_correct / max(binary_seen, 1))
         history["val_cam_bin_acc"].append(cam_correct / max(cam_seen, 1))
 
+        f1 = (2 * tp / (2 * tp + fp + fn).clamp_min(1.0)).cpu()
+        movement_f1 = float(f1[movement_idx].mean())
+        history.setdefault("val_per_action_f1", []).append(
+            {BINARY_ACTION_KEYS[i]: round(float(f1[i]), 4) for i in range(NUM_BINARY)}
+        )
+        history.setdefault("val_movement_f1", []).append(movement_f1)
+
         print(
             f"Epoch {ep + 1}/{epochs}  "
             f"train_loss={history['train_loss'][-1]:.4f}  "
             f"val_loss={history['val_loss'][-1]:.4f}  "
             f"bin_acc={history['val_binary_acc'][-1]:.4f}  "
-            f"cam_acc={history['val_cam_bin_acc'][-1]:.4f}"
+            f"cam_acc={history['val_cam_bin_acc'][-1]:.4f}  "
+            f"move_f1={movement_f1:.4f}"
         )
         _save_checkpoint(ep)
+        if keep_best and movement_f1 > best_movement_f1:
+            best_movement_f1 = movement_f1
+            ckpt = th.load(out_weights, map_location="cpu", weights_only=False)
+            ckpt["best_epoch"] = ep
+            ckpt["best_val_movement_f1"] = movement_f1
+            _atomic_save(ckpt, best_path)
+            print(f"  ↳ new best movement_f1={movement_f1:.4f} → {best_path}")
 
     print(f"Cached-head training complete. Saved to: {out_weights}")
     return model, test_set, history

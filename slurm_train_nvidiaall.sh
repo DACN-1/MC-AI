@@ -59,6 +59,10 @@ HIDDEN_DIM="${HIDDEN_DIM:-2048}"
 #   HISTORY_DROPOUT           Probability of zeroing past-action vector per
 #                             sample during training. 0.0 = off; 0.5 typical.
 #   LEARNABLE_BCE_TEMP=1      Add per-binary-action learnable temperature.
+#   KEEP_BEST=1               Also snapshot best-val-movement-F1 epoch to
+#                             model_best.pt (see --keep-best).
+#   FRAME_LEVEL_SPLIT=1       Legacy frame-level val/test split (leaky);
+#                             default is the trajectory-level split.
 #   RECIPE_TAG                Suffix appended to OUTPUT_DIR/cell name; lets
 #                             multiple recipes coexist without overwriting.
 FRAME_WEIGHT_MULTIPLIER="${FRAME_WEIGHT_MULTIPLIER:-1.0}"
@@ -71,6 +75,8 @@ CHOP_OVERSAMPLE_WEIGHT="${CHOP_OVERSAMPLE_WEIGHT:-1.0}"
 WEIGHTED_LOSS="${WEIGHTED_LOSS:-0}"
 CAM_WEIGHTED_LOSS="${CAM_WEIGHTED_LOSS:-0}"
 CAM_CE_WEIGHT="${CAM_CE_WEIGHT:-0.5}"
+KEEP_BEST="${KEEP_BEST:-0}"
+FRAME_LEVEL_SPLIT="${FRAME_LEVEL_SPLIT:-0}"
 RECIPE_TAG="${RECIPE_TAG:-}"
 
 LANG_TAG=$([ "$USE_LANGUAGE" = "1" ] && echo lang || echo nolang)
@@ -167,6 +173,12 @@ if [ "$CAM_WEIGHTED_LOSS" = "1" ]; then
 fi
 if [ "$(echo "$CAM_CE_WEIGHT != 0.5" | bc -l 2>/dev/null)" = "1" ]; then
     EXTRA_FLAGS+=("--cam-ce-weight" "$CAM_CE_WEIGHT")
+fi
+if [ "$KEEP_BEST" = "1" ]; then
+    EXTRA_FLAGS+=("--keep-best")
+fi
+if [ "$FRAME_LEVEL_SPLIT" = "1" ]; then
+    EXTRA_FLAGS+=("--frame-level-split")
 fi
 
 # ---------- run ------------------------------------------------------------

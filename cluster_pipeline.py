@@ -280,6 +280,22 @@ def main():
         "— this just scales the camera vs binary tradeoff.",
     )
     parser.add_argument(
+        "--keep-best",
+        action="store_true",
+        help="Additionally snapshot the epoch with the best val movement-F1 "
+        "(back/forward/jump/left/right/sprint mean) to model_best.pt. Decouples "
+        "'how long to train' from 'which weights to keep' — see the "
+        "ep10-vs-ep20 compound-overfit finding in docs/trials.md.",
+    )
+    parser.add_argument(
+        "--frame-level-split",
+        action="store_true",
+        help="Use the legacy frame-level random val/test split instead of the "
+        "trajectory-level (stem-grouped) default. Frame-level leaks temporally "
+        "adjacent frames train<->val; only for comparability with "
+        "pre-2026-06-10 checkpoints.",
+    )
+    parser.add_argument(
         "--end-to-end",
         action="store_true",
         help="Skip caching; train backbone+head end-to-end (legacy path).",
@@ -408,6 +424,8 @@ def main():
                 chop_oversample_weight=args.chop_oversample_weight,
                 cam_weighted_loss=args.cam_weighted_loss,
                 cam_ce_weight=args.cam_ce_weight,
+                split_by_trajectory=not args.frame_level_split,
+                keep_best=args.keep_best,
             )
         else:
             from feature_cache import CachedFeatureDataset, HeadOnlyAgent
