@@ -1,5 +1,84 @@
 # Trials — head-only recipe sweeps
 
+## Wave 1–5 sweep + reproducibility controls (2026-06-10/11) — CLOSED; eval variance dominates
+
+27 seeded runs (5 eps × 1000 steps, seeds 0–4, InventoryRewardWrapper) across
+four fronts: decode interventions on the SOTA ckpt (Wave 1), wrapper re-evals
+of orphaned ckpts (Wave 2), 9 knob retrains on the `clip_combined_lang_stride4`
+cache (Waves 3/5, all with the new trajectory-level split + keep-best), three
+new inference-time temporal mechanisms (Wave 4: `--chunk-ensemble`,
+`--execute-steps`, `--attack-hysteresis`), and three reproducibility controls.
+Raw logs: `output/eval_w/<tag>/<condition>/`. Summarize with
+`python output/summarize_eval_w.py`.
+
+### Results (dirt mean / max over 5 eps; chop where run)
+
+| Tag | What | C_chop | D_dirt |
+|---|---|---|---|
+| w11_thr | SOTA + `attack=0.005` (exp2 trick) | 0 | 0.00 |
+| w12_thrbias | SOTA + thr + `forward=1.0` bias | 0 | — |
+| w13_sampT15 | SOTA + `--sample T=1.5` | 0 | 1.00 / 2 |
+| w14_thr25 | SOTA + `attack=0.25` | 0 | — |
+| w41_ensemble | SOTA + chunk ensembling | 0 | 0.00 |
+| w42_openloop4 | SOTA + execute-k=4 | 0 | — |
+| w43_hyst | SOTA + attack hysteresis 40:0.2 | 0 | — |
+| w2_r3b / w2_slot50 | orphan ckpt re-evals | 0 / 0 | 0.00 / 0.00 |
+| w31_hd02 (+_best) | sc + history_dropout 0.2 | — | 0.00 (best: 0.20 / 1) |
+| w32_chop5 | slot30 + chop oversample 5 | — | 0.00 |
+| w33_slot20 / w33_slot40 | slot dropout 0.2 / 0.4 + chop3 | — | 0.00 / 0.00 |
+| w34_ep14 (+_best) | sc + 14 epochs | — | 0.00 / 0.00 |
+| w35_lr5e4_ep20 | sc + LR 5e-4, 20 ep | — | 0.00 |
+| w36_chunk4 | sc + chunk_size 4 | — | 0.00 |
+| w51_best20 | sc + 20 ep, best-epoch ckpt | — | 0.00 |
+| **w52_tsplit** | **sc re-trained, trajectory split** | — | **0.00** |
+| **w53_replica** | **sc re-trained, EXACT original recipe (frame split)** | — | **0.00** |
+| **w50_sota_rerun** | **the ORIGINAL 4.60 ckpt, re-run unchanged** | — | **0.00** |
+
+### Controls and the verdict
+
+1. **w53_replica = 0.00**: retraining the exact original `slot30_chop3` recipe
+   does not reproduce 4.60.
+2. **w50_sota_rerun = 0.00**: the *same artifact* that scored 4.60 on
+   2026-06-09 scores 0.00 on the same seeds two days later.
+3. **Determinism probe**: two back-to-back identical runs (same ckpt, seed,
+   stack, container) produce step-0 logits differing by max |Δ| ≈ 0.23 —
+   the env render/reset is not bit-deterministic even with `--seed`. Greedy
+   decode usually absorbs the jitter, but when a logit sits near threshold an
+   early action flips and the episode diverges chaotically.
+
+**Verdict: 5-episode wrapper-reward screens are dominated by run-to-run env
+variance, not by recipe quality.** The 4.60 "SOTA", the 3.20 slot30 and the
+1.60 ep20 numbers below (2026-06-08/09 leaderboard) were high-variance draws,
+not stable recipe effects — treat that entire leaderboard's ranking as
+unreliable. Any future reward-based comparison needs either 20–50 episodes
+per cell or a denser proxy metric (per-action firing/F1 against demos, attack-
+run statistics, inventory-delta event counts) before reward is trusted.
+
+### Chop behavioral analysis (why decode can't fix it)
+
+From `steps_*.json` on the chop runs: under plain greedy the SOTA head **never
+asserts attack** in the chop context (sigmoid lives in ~(0.005, 0.5) — 0 % of
+75 k steps with thr 0.5, bimodal 0 %/100 % per episode at thr 0.25, 100 % at
+thr 0.005 — and at 100 % it attacks air without aiming at trunks). Chunk
+ensembling suppresses attack entirely (later chunk steps are systematically
+more conservative, so averaging drags marginal logits below threshold) — it
+also zeroes dirt. Open-loop execution and hysteresis change nothing because
+the underlying logits are context-locked, not jittery. Chop failure is a
+policy/perception gap (no tree-seeking, no aim), not a decode problem.
+
+### Infra that landed with this sweep
+
+- `run_rollout.py`: `--chunk-ensemble`, `--execute-steps K`,
+  `--attack-hysteresis N[:THR]` (default-off, legacy byte-identical).
+- Trainer: trajectory-level val/test split by stem (default; old leaky
+  frame-level split behind `--frame-level-split`), per-epoch per-action val
+  F1 in history, `--keep-best`/`KEEP_BEST=1` → `model_best.pt` by movement
+  F1. Under the honest split, val movement-F1 is nearly flat across 1–20
+  epochs (~0.43–0.47) for every recipe — training length barely matters.
+- Cluster data note: `~/BIG/trajectories/` videos were deleted; head-only
+  retrains need only the restored `all_actions.json` per task (see
+  slurm_train_nvidiaall.sh stage-check fix).
+
 ## Camera-axis sweep (2026-06-09/10) — CLOSED, negative result
 
 Motivated by the chop-tasks-at-reward-0 problem: HANDOFF flagged "camera-aware

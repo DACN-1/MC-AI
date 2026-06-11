@@ -1,4 +1,35 @@
-# HANDOFF — 2026-06-10 update (canonical)
+# HANDOFF — 2026-06-11 update (canonical)
+
+## TL;DR — 2026-06-11 (Wave 1–5 sweep + controls: eval variance dominates)
+
+The full post-cache roadmap (decode sweeps, temporal decode mechanisms,
+orphan re-evals, 9 knob retrains, selection infra) ran overnight — 27 seeded
+eval runs + 10 cluster trainings. Full table in `docs/trials.md` (top
+section). Three findings, in order of importance:
+
+1. **The 4.60 dirt "SOTA" is not reproducible — and not because of the
+   recipes.** Exact-recipe retrain → 0.00. The *original artifact itself*
+   re-run on the same seeds → 0.00. Back-to-back identical runs differ in
+   step-0 logits by ~0.23 (env render/reset is not bit-deterministic), and
+   near-threshold logits occasionally flip an early action, after which the
+   episode diverges chaotically. **5-ep wrapper-reward screens are noise-
+   dominated; the 2026-06-08/09 leaderboard ranking is unreliable.** Use
+   20–50 eps per cell or denser proxy metrics before trusting reward.
+2. **Chop is a policy/perception gap, not decode.** The head never asserts
+   attack in chop contexts (sigmoid in ~(0.005, 0.5) for 75 k steps); forcing
+   it (thr 0.005) gives 100 % attack-of-air. Chunk ensembling suppresses
+   attack (far-horizon chunk steps are systematically conservative);
+   hysteresis/open-loop change nothing. All 7 chop interventions: reward 0.
+3. **Selection infra landed**: trajectory-level val split (honest; default),
+   per-epoch movement-F1 + `model_best.pt` keep-best, and three new decode
+   flags in `run_rollout.py`. Under the honest split, val movement-F1 is
+   flat (~0.43–0.47) across 1–20 epochs for every recipe.
+
+**Where this leaves the project:** stop tuning the CLIP head against 5-ep
+reward. The two defensible directions are (a) an eval-variance fix (more
+episodes per cell, and/or demo-grounded proxy metrics from steps_*.json) so
+comparisons mean something, and (b) the LLaVA Phase C cells (caches exist on
+cluster BIG) evaluated under that fixed protocol from day one.
 
 ## TL;DR — 2026-06-10 (camera-axis sweep: CLOSED, negative)
 
