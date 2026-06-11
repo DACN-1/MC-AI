@@ -119,6 +119,33 @@ New knobs that landed with this sweep (all default-off / legacy-identical):
 the matching `WEIGHTED_LOSS` / `CAM_WEIGHTED_LOSS` / `CAM_CE_WEIGHT` env vars
 in `slurm_train_nvidiaall.sh`.
 
+## Frame-history windows (2026-06-11) — CLOSED, negative
+
+The last untried post-cache lever: concatenate the K previous cached frame
+FEATURES (stride-spaced, `--frame-history-k`, commit 8158f38) to give the
+head visual motion context. Three cells on `clip_combined_lang_stride4`,
+identical knobs otherwise (trajectory split, keep-best, 10 ep):
+
+| Cell | Head input | Best val move-F1 (epoch) | Final val_loss |
+|---|---|---|---|
+| `tsplit_base` (K=0) | 1,536 | **0.4554** (3) | **0.6048** |
+| `fhist4` (K=4) | 7,680 | 0.4402 (7) | 0.6119 |
+| `fhist8` (K=8) | 13,824 | 0.4305 (7) | 0.6204 |
+
+Monotonic negative dose-response on both F1 and loss. Interpretation:
+stacked *global pooled* vectors add no usable motion signal — the global
+gist barely changes across stride-4 frames, so the extra dims are mostly
+redundant input to fit. Consistent with the representational thesis: the
+information loss happens at pooling, and no head-side input arrangement of
+pooled features recovers it. **Post-cache levers on pooled features are now
+exhausted on every axis tried** (loss weighting, sampling, dropout family,
+epochs/LR/capacity, decode calibration, temporal decode, visual history).
+The open bet is the spatial patch cache (`_patch4`, building).
+
+Note: `tsplit_base` (0.4554) is also the missing CLIP-lang baseline anchor
+under the honest split — slot30/chop3-family cells (0.43–0.47) do NOT beat
+it; the recipe knobs were within-noise on F1 too.
+
 # Head-only recipe sweep (2026-06-08/09)
 
 Comprehensive log of every recipe tested in the 2026-06-08/09 head-only sweep
