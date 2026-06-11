@@ -871,6 +871,7 @@ def train_cached_head(
     cam_ce_weight: float = 0.5,
     split_by_trajectory: bool = True,
     keep_best: bool = False,
+    frame_history_k: int = 0,
 ):
     """Train an MLP head on precomputed backbone features.
 
@@ -895,10 +896,12 @@ def train_cached_head(
         data_root=data_root,
         past_action_k=past_action_k,
         chunk_size=chunk_size,
+        frame_history_k=frame_history_k,
     )
     print(
         f"Cached dataset: {len(dataset):,} samples  "
-        f"(tag={cache_tag}  past_action_k={past_action_k}  chunk_size={chunk_size})"
+        f"(tag={cache_tag}  past_action_k={past_action_k}  chunk_size={chunk_size}"
+        f"  frame_history_k={frame_history_k})"
     )
 
     pos_weight = cam_weight = None
@@ -1078,6 +1081,7 @@ def train_cached_head(
                     "cam_ce_weight": cam_ce_weight,
                     "split_by_trajectory": split_by_trajectory,
                     "keep_best": keep_best,
+                    "frame_history_k": frame_history_k,
                     "camera_quantizer": {
                         "camera_maxval": DEFAULT_CAMERA_QUANTIZER.camera_maxval,
                         "camera_binsize": DEFAULT_CAMERA_QUANTIZER.camera_binsize,

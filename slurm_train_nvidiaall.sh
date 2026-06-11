@@ -80,6 +80,7 @@ CAM_WEIGHTED_LOSS="${CAM_WEIGHTED_LOSS:-0}"
 CAM_CE_WEIGHT="${CAM_CE_WEIGHT:-0.5}"
 KEEP_BEST="${KEEP_BEST:-0}"
 FRAME_LEVEL_SPLIT="${FRAME_LEVEL_SPLIT:-0}"
+FRAME_HISTORY_K="${FRAME_HISTORY_K:-0}"
 RECIPE_TAG="${RECIPE_TAG:-}"
 
 LANG_TAG=$([ "$USE_LANGUAGE" = "1" ] && echo lang || echo nolang)
@@ -208,6 +209,9 @@ if [ "$FRAME_LEVEL_SPLIT" = "1" ]; then
 fi
 if [ "$PATCH_GRID" -gt 0 ]; then
     EXTRA_FLAGS+=("--patch-grid" "$PATCH_GRID")
+fi
+if [ "$FRAME_HISTORY_K" -gt 0 ]; then
+    EXTRA_FLAGS+=("--frame-history-k" "$FRAME_HISTORY_K")
 fi
 
 # ---------- run ------------------------------------------------------------

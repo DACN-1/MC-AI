@@ -49,6 +49,14 @@ def _load_cached_head_agent(ckpt: dict, cfg: dict, device: str):
     past_action_dim = cfg.get("past_action_dim", 0)
     chunk_size = cfg.get("chunk_size", 1)
     hidden_dim = cfg.get("hidden_dim")
+    if cfg.get("frame_history_k", 0) > 0:
+        raise NotImplementedError(
+            "This head was trained with frame_history_k="
+            f"{cfg['frame_history_k']} (visual history windows); rollout "
+            "serving needs a per-episode frame-feature buffer in the "
+            "inference server, which is not implemented yet. Evaluate via "
+            "training metrics, or implement the buffer first."
+        )
     # cache tags are "<backbone>_<task>_<lang|nolang>[_strideN]" — the language
     # flag is a token, NOT a suffix (a `_stride4` suffix used to silently break
     # `endswith("nolang")`, loading nolang ckpts with use_language=True).

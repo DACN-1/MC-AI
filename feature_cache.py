@@ -383,9 +383,18 @@ class CachedFeatureDataset(th.utils.data.Dataset):
         data_root: str | Path,
         past_action_k: int = 0,
         chunk_size: int = 1,
+        frame_history_k: int = 0,
     ):
         self.past_action_k = past_action_k
         self.chunk_size = chunk_size
+        # Visual temporal context: concatenate the K previous CACHED frame
+        # features (stride-spaced, zero-padded at trajectory start, oldest
+        # first / current last) in front of the current frame's feature.
+        # Post-cache lever: a single frame + past *actions* carries no motion
+        # signal — the head can't tell "rotating toward the target" from
+        # "away" — but the cache already holds every sampled frame's feature,
+        # so the window is assembled dataset-side for free.
+        self.frame_history_k = frame_history_k
 
         self._features, self.meta = load_cache(cache_dir, tag)
 
@@ -435,7 +444,8 @@ class CachedFeatureDataset(th.utils.data.Dataset):
                         self.samples.append((stem, idx))
 
     def feature_dim(self) -> int:
-        return int(self.meta["feature_dim"])
+        """Effective head input width — (1 + frame_history_k) cache slots."""
+        return int(self.meta["feature_dim"]) * (1 + self.frame_history_k)
 
     def _past(self, stem: str, frame_idx: int) -> th.Tensor:
         if self.past_action_k == 0:
@@ -456,6 +466,20 @@ class CachedFeatureDataset(th.utils.data.Dataset):
         row = self.cache_index[stem][frame_idx]
         # Cast features to float32 — the head trains in fp32.
         feat = th.from_numpy(np.asarray(self._features[row], dtype=np.float32))
+        if self.frame_history_k > 0:
+            stride = int(self.meta.get("frame_stride", 1))
+            base_dim = int(self.meta["feature_dim"])
+            window = np.zeros(
+                ((self.frame_history_k + 1), base_dim), dtype=np.float32
+            )
+            for j in range(self.frame_history_k, 0, -1):
+                prev_row = self.cache_index[stem].get(frame_idx - j * stride)
+                if prev_row is not None:
+                    window[self.frame_history_k - j] = np.asarray(
+                        self._features[prev_row], dtype=np.float32
+                    )
+            window[-1] = feat.numpy()
+            feat = th.from_numpy(window.reshape(-1))
         target = th.from_numpy(
             self.targets_by_stem[stem][frame_idx : frame_idx + self.chunk_size]
         )

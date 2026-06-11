@@ -298,6 +298,17 @@ def main():
         "— this just scales the camera vs binary tradeoff.",
     )
     parser.add_argument(
+        "--frame-history-k",
+        type=int,
+        default=0,
+        help="Concatenate the K previous cached frame FEATURES (stride-spaced, "
+        "zero-padded at trajectory start) to the head input — visual motion "
+        "context from the existing cache, no rebuild needed. Head input dim "
+        "becomes (K+1)*cache_feature_dim. 0 = single-frame (legacy). NOTE: "
+        "rollout serving for K>0 heads is not implemented yet (needs a "
+        "per-episode feature buffer in the inference server).",
+    )
+    parser.add_argument(
         "--keep-best",
         action="store_true",
         help="Additionally snapshot the epoch with the best val movement-F1 "
@@ -445,6 +456,7 @@ def main():
                 cam_ce_weight=args.cam_ce_weight,
                 split_by_trajectory=not args.frame_level_split,
                 keep_best=args.keep_best,
+                frame_history_k=args.frame_history_k,
             )
         else:
             from feature_cache import CachedFeatureDataset, HeadOnlyAgent
