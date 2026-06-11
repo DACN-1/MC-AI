@@ -130,7 +130,9 @@ def enumerate_samples(
     return samples
 
 
-def _build_backbone(backbone: str, llava_id: str, use_language: bool, device: str):
+def _build_backbone(
+    backbone: str, llava_id: str, use_language: bool, device: str, patch_grid: int = 0
+):
     """Construct a frozen backbone with no action head usage. The head is
     initialised at minimal size (chunk_size=1, past_action_dim=0) but we never
     forward through it — we only call `encode()`.
@@ -138,6 +140,12 @@ def _build_backbone(backbone: str, llava_id: str, use_language: bool, device: st
     if backbone == "llava":
         from VLAAgent import VLAAgent
 
+        if patch_grid > 0:
+            raise NotImplementedError(
+                "patch_grid caching is CLIP-only for now — the LLaVA encode "
+                "path pools over joint image+text tokens and needs its own "
+                "spatial design"
+            )
         agent = VLAAgent(
             output_dim=1,
             backbone=llava_id,
@@ -153,6 +161,7 @@ def _build_backbone(backbone: str, llava_id: str, use_language: bool, device: st
             use_language=use_language,
             past_action_dim=0,
             chunk_size=1,
+            patch_grid=patch_grid,
         )
     else:
         raise ValueError(f"Unknown backbone: {backbone!r}")
@@ -200,6 +209,7 @@ def precompute(
     tag: str | None = None,
     frame_stride: int = 1,
     progress_interval: int = 100,
+    patch_grid: int = 0,
 ) -> Path:
     """Compute and write a feature cache. Returns the .npy path.
 
@@ -222,6 +232,8 @@ def precompute(
         tag = f"{backbone}_{task_part}_{lang_part}"
         if frame_stride > 1:
             tag += f"_stride{frame_stride}"
+        if patch_grid > 0:
+            tag += f"_patch{patch_grid}"
     cache_path = cache_dir / f"{tag}.npy"
     meta_path = cache_dir / f"{tag}.json"
     progress_path = cache_dir / f"{tag}.progress"
@@ -231,7 +243,7 @@ def precompute(
     except ImportError as e:
         raise ImportError("decord required for video decoding. pip install decord") from e
 
-    agent = _build_backbone(backbone, llava_id, use_language, device)
+    agent = _build_backbone(backbone, llava_id, use_language, device, patch_grid=patch_grid)
     # Probe feature_dim by encoding one sample (cheap; also needed to validate
     # resume against any prior cache file).
     with th.no_grad():
@@ -261,6 +273,7 @@ def precompute(
             and meta_existing.get("task_filter") == task_filter
             and meta_existing.get("llava_id") == expected_llava_id
             and meta_existing.get("frame_stride", 1) == frame_stride
+            and meta_existing.get("patch_grid", 0) == patch_grid
         )
         if matches:
             start_batch = _read_progress(progress_path)
@@ -284,6 +297,7 @@ def precompute(
             "use_language": use_language,
             "task_filter": task_filter,
             "frame_stride": frame_stride,
+            "patch_grid": patch_grid,
             "n_samples": len(samples),
             "feature_dim": feature_dim,
             "dtype": "float16",
@@ -537,6 +551,15 @@ def main():
         help="Cache every Nth frame per trajectory (N>1 cuts cost ~N-fold; "
         "targets/past-actions stay full-resolution, rollout unchanged)",
     )
+    p.add_argument(
+        "--patch-grid",
+        type=int,
+        default=0,
+        help="CLIP only: store a GxG average-pooled grid of vision-tower patch "
+        "tokens instead of the pooled global vector (plus the usual text "
+        "feature). 0 = legacy pooled mode. Cache tag gets a _patchG suffix. "
+        "Feature dim becomes G*G*1024 + 768 for ViT-L/14.",
+    )
     args = p.parse_args()
 
     precompute(
@@ -550,6 +573,7 @@ def main():
         device=args.device,
         tag=args.tag,
         frame_stride=args.frame_stride,
+        patch_grid=args.patch_grid,
     )
 
 

@@ -58,6 +58,13 @@ def _load_cached_head_agent(ckpt: dict, cfg: dict, device: str):
     is_clip = cache_tag.startswith("clip") or feature_dim < 2048
     tag_tokens = cache_tag.split("_")
     use_language = "nolang" not in tag_tokens
+    # Spatial caches carry a `patch<G>` token (e.g. clip_..._stride4_patch4);
+    # the rollout backbone must reproduce the same GxG patch-grid encode the
+    # head was trained on.
+    patch_grid = next(
+        (int(t[5:]) for t in tag_tokens if t.startswith("patch") and t[5:].isdigit()),
+        0,
+    )
 
     if is_clip:
         from frozen_vision_baseline import FrozenVisionAgent
@@ -67,6 +74,7 @@ def _load_cached_head_agent(ckpt: dict, cfg: dict, device: str):
             use_language=use_language,
             past_action_dim=0,
             chunk_size=1,
+            patch_grid=patch_grid,
         )
     else:
         backbone_module = VLAAgent(

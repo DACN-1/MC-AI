@@ -52,6 +52,9 @@ PAST_ACTION_K="${PAST_ACTION_K:-8}"
 CHUNK_SIZE="${CHUNK_SIZE:-8}"
 FRAME_STRIDE="${FRAME_STRIDE:-4}"
 HIDDEN_DIM="${HIDDEN_DIM:-2048}"
+# PATCH_GRID > 0: CLIP spatial patch-grid cache (GxG pooled vision-tower
+# patches + text feature). Cache tag + output dir get a _patch<G> suffix.
+PATCH_GRID="${PATCH_GRID:-0}"
 # Round 1 recipe knobs (all cache-safe; only DataLoader/loss-side changes):
 #   FRAME_WEIGHT_MULTIPLIER   WeightedRandomSampler boost for sustained-attack
 #                             frames. 1.0 = uniform; 5.0 typical.
@@ -82,6 +85,7 @@ RECIPE_TAG="${RECIPE_TAG:-}"
 LANG_TAG=$([ "$USE_LANGUAGE" = "1" ] && echo lang || echo nolang)
 TASK_TAG=${TASK_FILTER:-combined}
 STRIDE_TAG=$([ "$FRAME_STRIDE" -gt 1 ] && echo "_stride${FRAME_STRIDE}" || echo "")
+PATCH_TAG=$([ "$PATCH_GRID" -gt 0 ] && echo "_patch${PATCH_GRID}" || echo "")
 RECIPE_SUFFIX=$([ -n "$RECIPE_TAG" ] && echo "_${RECIPE_TAG}" || echo "")
 
 # ---------- storage layout -------------------------------------------------
@@ -90,7 +94,7 @@ mkdir -p "$NODE_SCRATCH"
 
 DATA_DIR="$REPO_ROOT/trajectories"                   # pre-extracted on BIG
 CACHE_DIR="$REPO_ROOT/caches"                        # persist on BIG
-OUTPUT_DIR="$REPO_ROOT/output/${BACKBONE}_${TASK_TAG}_${LANG_TAG}${STRIDE_TAG}${RECIPE_SUFFIX}"
+OUTPUT_DIR="$REPO_ROOT/output/${BACKBONE}_${TASK_TAG}_${LANG_TAG}${STRIDE_TAG}${PATCH_TAG}${RECIPE_SUFFIX}"
 
 export HF_HOME="$NODE_SCRATCH/hf_cache"
 export TRANSFORMERS_CACHE="$HF_HOME/transformers"
@@ -120,7 +124,7 @@ fi
 # from all_actions.json — the MP4s were deleted from BIG on 2026-06-10 to
 # make room for the LLaVA caches, so don't require them when the cache for
 # this cell already exists.
-EXPECTED_CACHE="$CACHE_DIR/${BACKBONE}_${TASK_TAG}_${LANG_TAG}${STRIDE_TAG}.npy"
+EXPECTED_CACHE="$CACHE_DIR/${BACKBONE}_${TASK_TAG}_${LANG_TAG}${STRIDE_TAG}${PATCH_TAG}.npy"
 for TASK in "${STAGE_TASKS[@]}"; do
     TRAJ_SUBDIR="$DATA_DIR/trajectory_task_${TASK}_length_3000"
     ACTIONS_JSON="$TRAJ_SUBDIR/all_actions.json"
@@ -201,6 +205,9 @@ if [ "$KEEP_BEST" = "1" ]; then
 fi
 if [ "$FRAME_LEVEL_SPLIT" = "1" ]; then
     EXTRA_FLAGS+=("--frame-level-split")
+fi
+if [ "$PATCH_GRID" -gt 0 ]; then
+    EXTRA_FLAGS+=("--patch-grid" "$PATCH_GRID")
 fi
 
 # ---------- run ------------------------------------------------------------

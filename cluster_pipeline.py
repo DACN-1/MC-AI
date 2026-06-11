@@ -48,7 +48,11 @@ from imitation_learning import (
 
 
 def _cache_tag(
-    backbone: str, task_filter: str | None, use_language: bool, frame_stride: int = 1
+    backbone: str,
+    task_filter: str | None,
+    use_language: bool,
+    frame_stride: int = 1,
+    patch_grid: int = 0,
 ) -> str:
     task_part = task_filter if task_filter else "combined"
     tag = f"{backbone}_{task_part}_{'lang' if use_language else 'nolang'}"
@@ -56,6 +60,8 @@ def _cache_tag(
     # tag so it never collides with (or resume-mismatches against) a full cache.
     if frame_stride > 1:
         tag += f"_stride{frame_stride}"
+    if patch_grid > 0:
+        tag += f"_patch{patch_grid}"
     return tag
 
 
@@ -69,6 +75,7 @@ def _ensure_cache(
     cache_batch_size: int,
     device: str,
     frame_stride: int = 1,
+    patch_grid: int = 0,
 ) -> str:
     """Build (or resume) the feature cache, returning the tag.
 
@@ -81,7 +88,7 @@ def _ensure_cache(
     import json as _json
     from feature_cache import precompute  # lazy import — only needed for cached path
 
-    tag = _cache_tag(backbone, task_filter, use_language, frame_stride)
+    tag = _cache_tag(backbone, task_filter, use_language, frame_stride, patch_grid)
     cache_npy = cache_dir / f"{tag}.npy"
     cache_meta = cache_dir / f"{tag}.json"
     progress_path = cache_dir / f"{tag}.progress"
@@ -118,6 +125,7 @@ def _ensure_cache(
         device=device,
         tag=tag,
         frame_stride=frame_stride,
+        patch_grid=patch_grid,
     )
     return tag
 
@@ -190,6 +198,16 @@ def main():
         help="Cache every Nth frame per trajectory (N>1 cuts backbone cost ~N-fold; "
         "targets/past-actions stay full-resolution, rollout unchanged). The cache "
         "tag gets a _stride<N> suffix so it never collides with a full cache.",
+    )
+    parser.add_argument(
+        "--patch-grid",
+        type=int,
+        default=0,
+        help="CLIP only: cache a GxG average-pooled spatial grid of vision-tower "
+        "patch tokens instead of the pooled global vector (text feature "
+        "unchanged). 0 = legacy pooled mode. Tag gets a _patch<G> suffix; "
+        "feature dim becomes G*G*1024 + 768 for ViT-L/14. Targets the "
+        "chop aiming hypothesis (docs/trials.md Wave 1-5 verdict).",
     )
     parser.add_argument(
         "--no-language",
@@ -394,6 +412,7 @@ def main():
             cache_batch_size=args.cache_batch_size,
             device=args.device,
             frame_stride=args.frame_stride,
+            patch_grid=args.patch_grid,
         )
 
         if not args.skip_train:
