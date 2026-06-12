@@ -309,6 +309,14 @@ def main():
         "per-episode feature buffer in the inference server).",
     )
     parser.add_argument(
+        "--head-stem-filter",
+        default=None,
+        help="Train-time task slice: keep only cache samples whose stem starts "
+        "with this prefix (e.g. chop_a_tree). Reuses a combined cache for "
+        "single-task control cells without rebuilding. Affects head training "
+        "only — the cache tag/contents are untouched.",
+    )
+    parser.add_argument(
         "--keep-best",
         action="store_true",
         help="Additionally snapshot the epoch with the best val movement-F1 "
@@ -457,6 +465,7 @@ def main():
                 split_by_trajectory=not args.frame_level_split,
                 keep_best=args.keep_best,
                 frame_history_k=args.frame_history_k,
+                stem_filter=args.head_stem_filter,
             )
         else:
             from feature_cache import CachedFeatureDataset, HeadOnlyAgent

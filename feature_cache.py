@@ -384,9 +384,15 @@ class CachedFeatureDataset(th.utils.data.Dataset):
         past_action_k: int = 0,
         chunk_size: int = 1,
         frame_history_k: int = 0,
+        stem_filter: str | None = None,
     ):
         self.past_action_k = past_action_k
         self.chunk_size = chunk_size
+        # Train-time task slice: keep only stems starting with this prefix
+        # (e.g. "chop_a_tree") without rebuilding the cache. Lets a combined
+        # cache serve single-task control cells (sample composition matches a
+        # single-task cache exactly; only the memmap rows read differ).
+        self.stem_filter = stem_filter
         # Visual temporal context: concatenate the K previous CACHED frame
         # features (stride-spaced, zero-padded at trajectory start, oldest
         # first / current last) in front of the current frame's feature.
@@ -419,6 +425,8 @@ class CachedFeatureDataset(th.utils.data.Dataset):
                 all_actions = json.load(fp)
             for stem in sorted(all_actions.keys()):
                 if stem not in cache_index:
+                    continue
+                if stem_filter and not stem.startswith(stem_filter):
                     continue
                 actions = all_actions[stem]
                 # range(last_valid + 1) is empty when chunk_size > len(actions),
