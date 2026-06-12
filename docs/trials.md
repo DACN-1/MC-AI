@@ -146,6 +146,42 @@ Note: `tsplit_base` (0.4554) is also the missing CLIP-lang baseline anchor
 under the honest split — slot30/chop3-family cells (0.43–0.47) do NOT beat
 it; the recipe knobs were within-noise on F1 too.
 
+## CLIP patch-grid pilot (2026-06-12) — spatial features do NOT beat pooled (flat-MLP head)
+
+The representational bet from the Wave 1–5 verdict: cache a 4×4 grid of
+vision-tower patch tokens (`--patch-grid 4` → 16×1024 + 768 text = 17,152
+dims, commit 4a0515a) so "where is the trunk" is representable. Pilot cell
+`clip_chop_a_tree_lang_stride4_patch4` (797,685 samples, 25.5 GB, ~8.7 h
+encode on a 2060) vs an exactly matched pooled control
+(`pooled_chop_ctl`: combined pooled cache sliced to the same 797,685 chop
+samples via `--head-stem-filter`, same split/knobs/epochs):
+
+| | pooled ctl | patch4 |
+|---|---|---|
+| best val move-F1 | **0.4979** (ep7) | 0.4577 (ep2) |
+| final val_loss | **0.7124** | 0.7254 |
+| test cam_mae° | 0.623 | 0.630 |
+| cam x/y bin acc | .8258/.8102 | .8232/.8094 |
+| left / right F1 | **.410** / .239 | .273 / .203 |
+| forward / sprint F1 | .677/.634 | .671/.602 |
+
+Pooled wins or ties on every metric; **camera prediction is bit-identical**
+— spatial features moved the aiming proxy not at all. Patch4 also shows the
+overfit signature (lower train_loss 0.682 vs 0.700, higher val_loss).
+
+**Interpretation (two readings, both important):**
+1. Camera supervision is saturated at the demo floor from global features
+   alone — the BC *targets* may simply not contain a learnable "aim at the
+   trunk" signal (demonstrator camera is dominated by smooth wander). The
+   bottleneck looks like the data/supervision, not the representation.
+2. Caveat: this pilot pairs patch features with a FLAT MLP (16× input dims,
+   same hidden). A cross-attention head over the grid could in principle use
+   spatial structure the MLP dilutes — untested. But given (1), analyze the
+   demos for aiming signal BEFORE buying more architecture.
+
+Also validated here: `--head-stem-filter` slices a combined cache to exactly
+the single-task composition (797,685 == patch cache sample count).
+
 # Head-only recipe sweep (2026-06-08/09)
 
 Comprehensive log of every recipe tested in the 2026-06-08/09 head-only sweep

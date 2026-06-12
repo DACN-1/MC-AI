@@ -1,4 +1,31 @@
-# HANDOFF — 2026-06-11 update (canonical)
+# HANDOFF — 2026-06-12 update (canonical)
+
+## TL;DR — 2026-06-12 (representation experiments: both negative; suspect the data)
+
+Two experiments closed overnight (details: docs/trials.md top sections):
+
+1. **Frame-history windows** (`--frame-history-k`): concatenating K previous
+   cached frame features is monotonically WORSE (base 0.4554 > K=4 0.4402 >
+   K=8 0.4305 val move-F1). Stacked global gists carry no usable motion
+   signal.
+2. **CLIP 4×4 patch-grid cache** (`--patch-grid 4`, 25.5 GB chop pilot, 8.7 h
+   encode): vs an exactly matched pooled control (same 797,685 chop
+   samples via the new `--head-stem-filter`), pooled wins or ties on every
+   metric and **camera prediction is identical** (mae 0.62° both). Spatial
+   features + flat MLP do not move the aiming proxy at all.
+
+**Where this points:** with decode, recipes, temporal context, and now
+representation all eliminated, the remaining suspect for chop is the
+SUPERVISION itself — the demos' camera targets may contain no learnable
+"aim at trunk" signal (smooth demonstrator wander dominates). Next cheap
+step: demo-side analysis — around block-break events, measure camera-
+movement statistics and attack onsets to quantify how much aiming signal
+exists to imitate. If it's absent, no architecture on this dataset fixes
+chop, and the paper should say so. (Residual untested branch: a cross-
+attention head over the patch grid instead of a flat MLP — only worth it if
+the demo analysis finds signal.)
+
+LLaVA next steps are unaffected: docs/llava_5090_runbook.md.
 
 ## TL;DR — 2026-06-11 (Wave 1–5 sweep + controls: eval variance dominates)
 
