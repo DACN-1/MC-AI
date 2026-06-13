@@ -159,6 +159,14 @@ def main():
         help="Head-training batch size (large is fine on cached features)",
     )
     parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument(
+        "--lr-schedule",
+        choices=("constant", "cosine"),
+        default="constant",
+        help="LR schedule for head training. 'cosine' anneals lr->0 over --epochs "
+        "(CosineAnnealingLR, stepped per epoch); damps the late-epoch val-F1 jitter "
+        "seen at constant LR so a true plateau is visible. Default constant (legacy).",
+    )
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--num-workers", type=int, default=2, help="DataLoader workers")
     parser.add_argument(
@@ -309,6 +317,24 @@ def main():
         "per-episode feature buffer in the inference server).",
     )
     parser.add_argument(
+        "--camera-onset-weight",
+        type=float,
+        default=1.0,
+        help="Upweight the camera CE on the pre-attack-onset aiming windows by "
+        "this factor (1.0 = off). Targets the rare/transient aiming frames the "
+        "2026-06-13 demo analysis found (camera bursts down toward the trunk "
+        "base before each sustained chop). Unlike --cam-weighted-loss (global "
+        "bin frequency) and the sampler path (reweights binary losses too), "
+        "this touches ONLY the camera CE on onset windows. Cache-safe.",
+    )
+    parser.add_argument(
+        "--camera-onset-window",
+        type=int,
+        default=8,
+        help="Frames before each sustained-attack-run onset to flag as the "
+        "aiming window for --camera-onset-weight (default 8 ~ 0.4 s).",
+    )
+    parser.add_argument(
         "--head-stem-filter",
         default=None,
         help="Train-time task slice: keep only cache samples whose stem starts "
@@ -446,6 +472,7 @@ def main():
                 batch_size=args.batch_size,
                 epochs=args.epochs,
                 lr=args.lr,
+                lr_schedule=args.lr_schedule,
                 device=args.device,
                 num_workers=args.num_workers,
                 past_action_k=args.past_action_k,
@@ -466,6 +493,8 @@ def main():
                 keep_best=args.keep_best,
                 frame_history_k=args.frame_history_k,
                 stem_filter=args.head_stem_filter,
+                camera_onset_weight=args.camera_onset_weight,
+                camera_onset_window=args.camera_onset_window,
             )
         else:
             from feature_cache import CachedFeatureDataset, HeadOnlyAgent

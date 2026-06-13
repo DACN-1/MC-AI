@@ -69,7 +69,7 @@ class TestFrameHistory(unittest.TestCase):
     def test_k0_is_legacy(self):
         ds = self._ds(0)
         self.assertEqual(ds.feature_dim(), 3)
-        feat, _, _ = ds[2]  # frame 4
+        feat = ds[2][0]  # frame 4
         self.assertTrue(th.equal(feat, th.full((3,), 4.0)))
 
     def test_window_order_and_padding(self):

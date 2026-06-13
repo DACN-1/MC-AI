@@ -385,9 +385,15 @@ class CachedFeatureDataset(th.utils.data.Dataset):
         chunk_size: int = 1,
         frame_history_k: int = 0,
         stem_filter: str | None = None,
+        camera_onset_weights: dict | None = None,
     ):
         self.past_action_k = past_action_k
         self.chunk_size = chunk_size
+        # Per-frame camera-CE weight (1.0 default). When supplied (keyed by
+        # stem -> (n,) array), __getitem__ returns the chunk slice so the
+        # trainer can upweight the camera loss on pre-attack-onset aiming
+        # windows. See imitation_learning.compute_camera_onset_weights.
+        self.camera_onset_weights = camera_onset_weights or {}
         # Train-time task slice: keep only stems starting with this prefix
         # (e.g. "chop_a_tree") without rebuilding the cache. Lets a combined
         # cache serve single-task control cells (sample composition matches a
@@ -491,7 +497,14 @@ class CachedFeatureDataset(th.utils.data.Dataset):
         target = th.from_numpy(
             self.targets_by_stem[stem][frame_idx : frame_idx + self.chunk_size]
         )
-        return feat, target, self._past(stem, frame_idx)
+        cw = self.camera_onset_weights.get(stem)
+        if cw is None:
+            cam_w = th.ones(self.chunk_size, dtype=th.float32)
+        else:
+            cam_w = th.from_numpy(
+                cw[frame_idx : frame_idx + self.chunk_size].astype(np.float32)
+            )
+        return feat, target, self._past(stem, frame_idx), cam_w
 
 
 class HeadOnlyAgent(th.nn.Module):

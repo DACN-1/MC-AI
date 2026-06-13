@@ -248,6 +248,7 @@ def vla_loss(
     cam_weight: th.Tensor | None = None,
     focal_gamma: float = 0.0,
     cam_ce_weight: float = 0.5,
+    cam_sample_weight: th.Tensor | None = None,
 ) -> tuple[th.Tensor, float, float]:
     """BCE on binary actions + cross-entropy on each camera axis, averaged over
     the chunk axis when present.
@@ -272,6 +273,13 @@ def vla_loss(
                  while leaving rare movement keys at 15-60% F1. Composes with
                  pos_weight when both are set, though focal alone is usually
                  enough.
+        cam_sample_weight: optional (B,) or (B, N) per-frame weight on the
+                 camera CE only. A weighted mean (Σw·ce / Σw) replaces the
+                 plain mean, so the camera head focuses on the high-weight
+                 frames without changing the overall bce/cam scale. Used to
+                 upweight the pre-attack-onset aiming windows (see
+                 `compute_camera_onset_weights` + the 2026-06-13 demo
+                 analysis). Defaults to a uniform mean (legacy).
 
     Returns (total_loss, bce_value, camera_ce_value).
     """
@@ -279,6 +287,10 @@ def vla_loss(
         logits = logits.reshape(-1, logits.size(-1))
     if targets.dim() == 3:
         targets = targets.reshape(-1, targets.size(-1))
+    if cam_sample_weight is not None:
+        cam_sample_weight = cam_sample_weight.reshape(-1).to(
+            logits.device, logits.dtype
+        )
 
     binary_logits = logits[:, :NUM_BINARY]
     binary_targets = targets[:, :NUM_BINARY]
@@ -305,8 +317,19 @@ def vla_loss(
         bce = nn.functional.binary_cross_entropy_with_logits(
             binary_logits, binary_targets, pos_weight=pos_weight
         )
-    ce_x = nn.functional.cross_entropy(cam_x_logits, cam_x_targets, weight=cam_weight)
-    ce_y = nn.functional.cross_entropy(cam_y_logits, cam_y_targets, weight=cam_weight)
+    if cam_sample_weight is not None:
+        ce_x_elem = nn.functional.cross_entropy(
+            cam_x_logits, cam_x_targets, weight=cam_weight, reduction="none"
+        )
+        ce_y_elem = nn.functional.cross_entropy(
+            cam_y_logits, cam_y_targets, weight=cam_weight, reduction="none"
+        )
+        wsum = cam_sample_weight.sum().clamp_min(1e-8)
+        ce_x = (cam_sample_weight * ce_x_elem).sum() / wsum
+        ce_y = (cam_sample_weight * ce_y_elem).sum() / wsum
+    else:
+        ce_x = nn.functional.cross_entropy(cam_x_logits, cam_x_targets, weight=cam_weight)
+        ce_y = nn.functional.cross_entropy(cam_y_logits, cam_y_targets, weight=cam_weight)
     cam_ce = cam_ce_weight * (ce_x + ce_y)
 
     return bce + cam_ce, bce.item(), cam_ce.item()
@@ -420,6 +443,66 @@ def compute_task_active_weights(
     if not out:
         raise RuntimeError(
             f"compute_task_active_weights: no trajectories under {root} "
+            f"(task_filter={task_filter!r}) — check the data path"
+        )
+    return out
+
+
+def compute_camera_onset_weights(
+    data_root: str | Path,
+    task_filter: str | None = None,
+    pre_window: int = 8,
+    min_run_length: int = 30,
+    multiplier: float = 5.0,
+) -> dict[str, np.ndarray]:
+    """Per-frame CAMERA-loss weight = `multiplier` inside the aiming window
+    just before a sustained-attack-run onset, else 1.0.
+
+    Motivated by the 2026-06-13 demo analysis (scripts/analyze_chop_aiming.py):
+    the demonstrator aims — camera bursts (pitch down toward the trunk base)
+    in the ~6 frames before committing to a sustained chop, then settles. That
+    signal is real and directional but RARE/TRANSIENT, so the per-frame camera
+    CE — dominated by the 78 % still-camera majority — averages it out. This
+    flags `[onset - pre_window, onset)` of every attack run ≥ `min_run_length`
+    so `vla_loss` can upweight the camera CE there specifically (unlike
+    `compute_task_active_weights`, which feeds the SAMPLER and reweights binary
+    losses too, and unlike `cam_weighted_loss`, which reweights by global bin
+    frequency rather than these transient moments).
+
+    Returns: `{stem: weights_per_frame (n,) float32}`.
+    """
+    root = Path(data_root)
+    out: dict[str, np.ndarray] = {}
+    for traj_dir in _iter_trajectory_dirs(root, task_filter):
+        actions_path = traj_dir / "all_actions.json"
+        if not actions_path.exists():
+            continue
+        with actions_path.open("r", encoding="utf-8") as fp:
+            all_actions = json.load(fp)
+        for stem, actions in all_actions.items():
+            n = len(actions)
+            attack = np.zeros(n, dtype=bool)
+            for i, a in enumerate(actions):
+                v = a.get("attack", 0)
+                if isinstance(v, list):
+                    v = v[0]
+                attack[i] = int(v) == 1
+            weights = np.ones(n, dtype=np.float32)
+            i = 0
+            while i < n:
+                if attack[i] and (i == 0 or not attack[i - 1]):
+                    j = i
+                    while j < n and attack[j]:
+                        j += 1
+                    if j - i >= min_run_length:
+                        weights[max(0, i - pre_window) : i] = multiplier
+                    i = j
+                else:
+                    i += 1
+            out[stem] = weights
+    if not out:
+        raise RuntimeError(
+            f"compute_camera_onset_weights: no trajectories under {root} "
             f"(task_filter={task_filter!r}) — check the data path"
         )
     return out
@@ -839,8 +922,8 @@ def split_indices_by_stem(
 
 
 def _cached_collate(batch):
-    feats, targets, pasts = zip(*batch)
-    return th.stack(feats), th.stack(targets), th.stack(pasts)
+    feats, targets, pasts, cam_w = zip(*batch)
+    return th.stack(feats), th.stack(targets), th.stack(pasts), th.stack(cam_w)
 
 
 def train_cached_head(
@@ -851,6 +934,7 @@ def train_cached_head(
     batch_size: int = 256,
     epochs: int = 10,
     lr: float = 1e-3,
+    lr_schedule: str = "constant",
     device: str = "cuda" if th.cuda.is_available() else "cpu",
     val_split: float = 0.1,
     test_split: float = 0.1,
@@ -873,6 +957,8 @@ def train_cached_head(
     keep_best: bool = False,
     frame_history_k: int = 0,
     stem_filter: str | None = None,
+    camera_onset_weight: float = 1.0,
+    camera_onset_window: int = 8,
 ):
     """Train an MLP head on precomputed backbone features.
 
@@ -891,6 +977,23 @@ def train_cached_head(
     device = _resolve_device(device)
     _print_device_info(device)
 
+    use_camera_onset = camera_onset_weight > 1.0
+    camera_onset_weights = None
+    if use_camera_onset:
+        camera_onset_weights = compute_camera_onset_weights(
+            data_root,
+            task_filter=None,  # whatever stems landed in the cache
+            pre_window=camera_onset_window,
+            multiplier=camera_onset_weight,
+        )
+        n_flagged = sum(int((w > 1.0).sum()) for w in camera_onset_weights.values())
+        n_total = sum(int(w.size) for w in camera_onset_weights.values())
+        print(
+            f"Camera-onset CE weighting ON — multiplier={camera_onset_weight} "
+            f"window={camera_onset_window}; {n_flagged:,}/{n_total:,} frames "
+            f"flagged ({100 * n_flagged / max(n_total, 1):.1f}%)"
+        )
+
     dataset = CachedFeatureDataset(
         cache_dir=cache_dir,
         tag=cache_tag,
@@ -899,6 +1002,7 @@ def train_cached_head(
         chunk_size=chunk_size,
         frame_history_k=frame_history_k,
         stem_filter=stem_filter,
+        camera_onset_weights=camera_onset_weights,
     )
     print(
         f"Cached dataset: {len(dataset):,} samples  "
@@ -1047,6 +1151,19 @@ def train_cached_head(
 
     start_epoch, history = _try_resume_training(out_weights, model, optim, device, restart)
 
+    # Optional cosine LR decay (lr -> 0 over `epochs`), stepped once per epoch.
+    # Damps the late-epoch val-F1 jitter seen at constant LR. On resume, fast-
+    # forward the schedule to the already-completed epoch count so the curve is
+    # identical whether or not the run was interrupted.
+    scheduler = None
+    if lr_schedule == "cosine":
+        scheduler = th.optim.lr_scheduler.CosineAnnealingLR(optim, T_max=epochs)
+        for _ in range(start_epoch):
+            scheduler.step()
+        print(f"Cosine LR schedule ON — lr {lr:.1e} -> 0 over {epochs} epochs")
+    elif lr_schedule != "constant":
+        raise ValueError(f"unknown lr_schedule={lr_schedule!r} (expected 'constant' or 'cosine')")
+
     def _save_checkpoint(epoch_just_completed: int) -> None:
         _atomic_save(
             {
@@ -1085,6 +1202,9 @@ def train_cached_head(
                     "keep_best": keep_best,
                     "frame_history_k": frame_history_k,
                     "stem_filter": stem_filter,
+                    "lr_schedule": lr_schedule,
+                    "camera_onset_weight": camera_onset_weight,
+                    "camera_onset_window": camera_onset_window,
                     "camera_quantizer": {
                         "camera_maxval": DEFAULT_CAMERA_QUANTIZER.camera_maxval,
                         "camera_binsize": DEFAULT_CAMERA_QUANTIZER.camera_binsize,
@@ -1115,10 +1235,11 @@ def train_cached_head(
     for ep in range(start_epoch, epochs):
         model.train()
         train_total = train_bce = train_cam = 0.0
-        for feats, acts, pasts in train_loader:
+        for feats, acts, pasts, cam_w in train_loader:
             feats = feats.to(device)
             acts = acts.to(device)
             pasts = pasts.to(device)
+            cam_w = cam_w.to(device) if use_camera_onset else None
             pasts = apply_history_dropout(pasts, history_dropout)
             pasts = apply_past_action_slot_dropout(
                 pasts, past_action_slot_dropout, past_action_k
@@ -1128,6 +1249,7 @@ def train_cached_head(
             loss, bce_v, cam_v = vla_loss(
                 logits, acts, pos_weight, cam_weight,
                 focal_gamma=focal_gamma, cam_ce_weight=cam_ce_weight,
+                cam_sample_weight=cam_w,
             )
             loss.backward()
             optim.step()
@@ -1147,10 +1269,12 @@ def train_cached_head(
         fp = th.zeros(NUM_BINARY, device=device)
         fn = th.zeros(NUM_BINARY, device=device)
         with th.no_grad():
-            for feats, acts, pasts in val_loader:
+            for feats, acts, pasts, _cam_w in val_loader:
                 feats = feats.to(device)
                 acts = acts.to(device)
                 pasts = pasts.to(device)
+                # Val loss stays UNWEIGHTED so val_loss / movement-F1 remain
+                # comparable across cells for model selection.
                 logits = model(feats, pasts)
                 loss, bce_v, cam_v = vla_loss(
                     logits, acts, pos_weight, cam_weight,
@@ -1203,6 +1327,8 @@ def train_cached_head(
             ckpt["best_val_movement_f1"] = movement_f1
             _atomic_save(ckpt, best_path)
             print(f"  ↳ new best movement_f1={movement_f1:.4f} → {best_path}")
+        if scheduler is not None:
+            scheduler.step()
 
     print(f"Cached-head training complete. Saved to: {out_weights}")
     return model, test_set, history
@@ -1237,7 +1363,7 @@ def evaluate_cached(
     cam_y_target_bins: list[th.Tensor] = []
 
     with th.no_grad():
-        for feats, acts, pasts in loader:
+        for feats, acts, pasts, _cam_w in loader:
             feats = feats.to(device)
             acts = acts.to(device)
             pasts = pasts.to(device)

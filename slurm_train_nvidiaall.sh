@@ -82,6 +82,8 @@ KEEP_BEST="${KEEP_BEST:-0}"
 FRAME_LEVEL_SPLIT="${FRAME_LEVEL_SPLIT:-0}"
 FRAME_HISTORY_K="${FRAME_HISTORY_K:-0}"
 HEAD_STEM_FILTER="${HEAD_STEM_FILTER:-}"
+CAMERA_ONSET_WEIGHT="${CAMERA_ONSET_WEIGHT:-1.0}"
+CAMERA_ONSET_WINDOW="${CAMERA_ONSET_WINDOW:-8}"
 RECIPE_TAG="${RECIPE_TAG:-}"
 
 LANG_TAG=$([ "$USE_LANGUAGE" = "1" ] && echo lang || echo nolang)
@@ -216,6 +218,10 @@ if [ "$FRAME_HISTORY_K" -gt 0 ]; then
 fi
 if [ -n "$HEAD_STEM_FILTER" ]; then
     EXTRA_FLAGS+=("--head-stem-filter" "$HEAD_STEM_FILTER")
+fi
+if [ "$(echo "$CAMERA_ONSET_WEIGHT != 1.0" | bc -l 2>/dev/null)" = "1" ]; then
+    EXTRA_FLAGS+=("--camera-onset-weight" "$CAMERA_ONSET_WEIGHT"
+                  "--camera-onset-window" "$CAMERA_ONSET_WINDOW")
 fi
 
 # ---------- run ------------------------------------------------------------
