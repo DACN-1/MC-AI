@@ -1,4 +1,27 @@
-# HANDOFF — 2026-06-12 update (canonical)
+# HANDOFF — 2026-06-13 update (canonical)
+
+## TL;DR — 2026-06-13 (demo analysis flips the chop conclusion)
+
+The 2026-06-12 handoff guessed the demos might contain no aiming signal.
+**Wrong — they do.** `scripts/analyze_chop_aiming.py` (action-only,
+5,365 sustained-chop onsets) shows a clear, DIRECTIONAL aim-then-chop
+signature: camera bursts to 2.67° in the ~6 frames before attack commit
+(consistently pitching DOWN toward the trunk base, signed −0.45 == abs 0.45),
+then settles to 1.37° during the chop.
+
+So chop supervision is real; the model misses it because the signal is rare
+and transient (~5 frames per 4.5 s run) and the per-frame loss is dominated
+by the attack=1 / camera-still majority (83 % / 78 %). This unifies all
+prior negatives: decode, recipes, temporal context, AND representation
+(patch/frame-history) all fail because none of them re-weight the loss
+toward the aiming frames.
+
+**Next experiment (targeted post-cache, head-only on existing pooled cache):**
+camera CE upweighted on the pre-onset aiming windows (onset-aligned, not the
+global bin-frequency `cam_weighted_loss`). Reuse the run-detection from
+`imitation_learning.compute_task_active_weights` to build a per-frame camera-
+loss weight. The aux "is-chopping-segment" head is the structural variant.
+This is the first intervention aimed at the actual diagnosed bottleneck.
 
 ## TL;DR — 2026-06-12 (representation experiments: both negative; suspect the data)
 

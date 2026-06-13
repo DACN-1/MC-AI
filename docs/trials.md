@@ -146,6 +146,43 @@ Note: `tsplit_base` (0.4554) is also the missing CLIP-lang baseline anchor
 under the honest split — slot30/chop3-family cells (0.43–0.47) do NOT beat
 it; the recipe knobs were within-noise on F1 too.
 
+## Demo aiming analysis (2026-06-13) — the signal IS there, the loss drowns it
+
+Reframes the whole chop investigation. After decode/recipe/temporal/
+representation all failed, the open question was whether the demos contain a
+learnable "aim at the trunk" signal at all. `scripts/analyze_chop_aiming.py`
+aligns camera to sustained-attack-run onsets (300 stems, 5,365 onsets,
+median chop run 4.5 s):
+
+```
+              aiming window         onset       locked-on chop
+ rel frame:  -15   -9   -3     [attack starts]     +9   +15
+ |camera|:   2.2   2.5   3.3        ↓ settles ↓     1.2   0.9
+```
+
+- Pre-onset mean |camera| = **2.67°**, during-chop = **1.37°** — a camera
+  burst peaking ~3 frames before the agent commits, settling once locked on.
+- **Directional, not noise:** pre-onset pitch signed −0.446 == abs 0.446 —
+  the demonstrator consistently pitches DOWN (toward the trunk base) before
+  chopping. Yaw weaker but also directional (+0.155 == 0.155).
+
+**Conclusion flip:** the "aim then chop" pattern is clearly present and
+learnable. The model fails to learn it because it is RARE and TRANSIENT (a
+~5-frame burst per 4.5 s run) and drowned by the per-frame loss, where 83 %
+of frames are attack=1 and 78 % are camera-still. The two representation
+negatives (patch, frame-history) are consistent: better *inputs* can't help
+when the *loss* never emphasizes the aiming frames. Compounding it: the
+aiming pitch (~0.45°/frame) quantizes into the near-zero mu-law bins (4-6),
+exactly where the still-camera majority also lives.
+
+**Targeted post-cache fix (untried, next):** upweight the camera CE on the
+pre-attack-onset aiming windows specifically — onset-aligned, NOT the global
+bin-frequency reweighting `cam_weighted_loss` did (which is why that failed).
+Implementable head-only on the existing pooled cache via a per-frame camera-
+loss weight = high inside [onset-W, onset] of each sustained run (reuse the
+run-finding logic from `compute_task_active_weights`). The aux
+"is-chopping-segment" head is the structural variant of the same idea.
+
 ## CLIP patch-grid pilot (2026-06-12) — spatial features do NOT beat pooled (flat-MLP head)
 
 The representational bet from the Wave 1–5 verdict: cache a 4×4 grid of
