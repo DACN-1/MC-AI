@@ -146,6 +146,49 @@ Note: `tsplit_base` (0.4554) is also the missing CLIP-lang baseline anchor
 under the honest split — slot30/chop3-family cells (0.43–0.47) do NOT beat
 it; the recipe knobs were within-noise on F1 too.
 
+## Onset-windowed camera-CE weighting (2026-06-13) — does NOT help; the ceiling is the features
+
+Direct test of the diagnosis below: upweight the camera CE 5×/15×/40× on the
+pre-attack-onset aiming windows (`--camera-onset-weight`, commit 321eb31).
+Chop-only on the pooled cache, matched to `pooled_chop_ctl`. Aggregate
+metrics are useless here (78 % still-camera majority), so evaluate camera bin
+accuracy RESTRICTED to the 3,991 onset-window test frames
+(`scripts/eval_onset_camera.py`):
+
+| cell | camx all | camy all | **camx onset** | **camy onset** |
+|---|---|---|---|---|
+| pooled_chop_ctl | 0.840 | 0.838 | 0.641 | 0.637 |
+| chop_onset5 | 0.841 | 0.836 | 0.645 | 0.643 |
+| chop_onset15 | 0.838 | 0.834 | 0.635 | 0.638 |
+| chop_onset40 | 0.832 | 0.830 | 0.625 | 0.631 |
+
+Two things, both informative:
+1. **Diagnosis validated:** onset frames are genuinely the hard frames —
+   camera accuracy 0.64 there vs 0.84 on still frames. The model fails
+   exactly where aiming is needed.
+2. **But weighting doesn't fix it.** onset5's +0.6pp on the aiming pitch is
+   within 1 SE (n=3,991, SE_diff ≈ 1.1pp) — noise. 15×/40× monotonically
+   degrade, and onset40 significantly hurts the aggregate (camx_all −0.9pp
+   over 80 k frames ≈ 6 SE). Forcing the camera loss onto the aiming frames
+   buys nothing the head can use.
+
+**Why:** the head simply cannot predict trunk-relative aiming from a single
+pooled CLIP frame, even when the loss is focused on it — the same ceiling the
+patch-grid pilot hit from the representation side. Compounding it: the aiming
+pitch (~0.45°/frame) is sub-quantization — it lands in mu-law bins 4-6, so
+even "perfect" aiming barely differs from predicting still. So the
+2026-06-13 "loss drowns the signal" framing is only half right: focusing the
+loss confirms aiming frames are hard, but the binding constraint is that
+**single-frame pooled features + 11-bin camera can't represent the aiming
+decision**, full stop. Loss-side and representation-side fixes both hit the
+same wall.
+
+**Net for chop:** post-cache is exhausted from every angle (decode, recipe,
+temporal, representation, AND targeted loss). A real fix needs the supervision
+at finer camera resolution AND a spatial+temporal encoder trained together —
+i.e. closer to VPT than to frozen-VLM + MLP. For the thesis this is a clean,
+well-instrumented ceiling result.
+
 ## Demo aiming analysis (2026-06-13) — the signal IS there, the loss drowns it
 
 Reframes the whole chop investigation. After decode/recipe/temporal/

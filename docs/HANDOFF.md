@@ -1,5 +1,26 @@
 # HANDOFF — 2026-06-13 update (canonical)
 
+## TL;DR — 2026-06-13 PM (onset camera-loss tested: ceiling is the features, not the loss)
+
+Ran the targeted fix the morning analysis pointed to — onset-windowed camera-CE
+weighting (`--camera-onset-weight` 5/15/40×, commit 321eb31), evaluated on the
+aiming frames specifically (`scripts/eval_onset_camera.py`). Result: **does not
+help.** Onset-frame pitch accuracy 0.637 (baseline) → 0.643 (5×, within noise)
+→ 0.631 (40×, degraded). The diagnosis was confirmed (aiming frames ARE hard:
+0.64 vs 0.84 on still frames) but the head can't learn trunk-relative aiming
+from a single pooled CLIP frame even when the loss is focused on it — same
+ceiling the patch-grid pilot hit from the representation side. Compounding it,
+the aiming pitch (~0.45°/frame) is sub-quantization (mu-law bins 4-6 ≈ "still").
+
+**Chop is now exhausted from every post-cache angle** — decode, recipe,
+temporal, representation (patch + frame-history), and targeted loss. The
+conclusion for the write-up: BC of aiming on frozen-VLM pooled features + an
+11-bin camera hits a representational/quantization ceiling; a real fix needs
+finer camera supervision and a jointly-trained spatial+temporal encoder
+(VPT-like), which is out of scope for the frozen-backbone ablation. The 2×2
+language story and the LLaVA cells (runbook ready) are unaffected and remain
+the paper's spine.
+
 ## TL;DR — 2026-06-13 (demo analysis flips the chop conclusion)
 
 The 2026-06-12 handoff guessed the demos might contain no aiming signal.
