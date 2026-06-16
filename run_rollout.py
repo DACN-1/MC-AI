@@ -492,7 +492,7 @@ def run(args: argparse.Namespace) -> None:
                         inv_snap[k] = iv
 
             dominant = _dominant_action_key(minerl_action)
-            logger.log_step(dominant, reward)
+            logger.log_step(dominant, reward, inv_snap)
 
             step_log.append(
                 {

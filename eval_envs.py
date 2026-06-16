@@ -123,6 +123,18 @@ class _Combined640EnvSpec(HumanControlEnvSpec):
     def create_rewardables(self) -> List[Handler]:
         return [handlers.RewardForCollectingItems(self.reward_items)]
 
+    def create_observables(self) -> List[Handler]:
+        # POV is all the AGENT consumes (run_rollout feeds only obs['pov'] to the
+        # head), so this extra observable does NOT change behaviour or the trained
+        # distribution. It is a pure LOGGING channel: RewardForCollectingItems is
+        # known-broken in this env config (dirt/logs visibly enter the HUD with
+        # total_reward=0), so per-step inventory counts of the target items —
+        # 'log' from chopping a tree, 'dirt' from digging — are the only
+        # reward-independent measure of whether the task actually happened.
+        observables = super().create_observables()
+        observables.append(handlers.FlatInventoryObservation(["log", "dirt"]))
+        return observables
+
     def create_agent_start(self) -> List[Handler]:
         # Keep the gui/gamma/fov/cursor + low-level-input handlers from the base.
         # The MineDreamer generation agent ran bare-handed (info.json inventory=None;
