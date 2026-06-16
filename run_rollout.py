@@ -215,8 +215,15 @@ class InventoryRewardWrapper(gym.Wrapper):
 
 # Mapping from env-id substring to the items whose inventory delta we reward.
 # Mirrors eval_envs.py's reward_items but bypasses Malmo's broken handler.
+# NB: chopping yields per-wood item names (oak_log/birch_log/...), NOT a bare
+# "log" — watching "log" is why chop reward stayed 0 (confirmed via probe: the
+# inventory has oak_log/birch_log, never "log"). Reward every wood-log type.
+# "dirt" is a real item name, so the dirt entry already worked (verified:
+# total_reward 3.0 == 3 dirt collected).
+_LOG_ITEMS = ("oak_log", "birch_log", "spruce_log", "jungle_log",
+              "dark_oak_log", "acacia_log")
 _INVENTORY_REWARD_BY_ENV = (
-    ("ChopATree", {"log": 1.0}),
+    ("ChopATree", {item: 1.0 for item in _LOG_ITEMS}),
     ("CollectDirt", {"dirt": 1.0}),
 )
 

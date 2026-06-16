@@ -36,6 +36,9 @@ EPISODES="${EPISODES:-10}"
 MAX_STEPS="${MAX_STEPS:-1000}"
 SERVER_PORT="${SERVER_PORT:-8765}"
 DEVICE="${DEVICE:-mps}"
+# Space-separated allowlist of conditions to run (default: all 4). For task-
+# performance screening pass e.g. CONDITIONS="C_chop_task D_dirt_task".
+CONDITIONS="${CONDITIONS:-A_chop_nocap B_chop_ood C_chop_task D_dirt_task}"
 # Each suite-run lives under output/evaluation/<endtime>_<modeltag>/. While
 # the run is in flight the dir is .running_<starttime>_<modeltag>/; on a
 # successful exit it is atomically renamed to <endtime>_<modeltag>/. Override
@@ -106,6 +109,10 @@ run_condition() {
     local cond_name="$1"
     local env_id="$2"
     local prompt="$3"
+    case " $CONDITIONS " in
+        *" $cond_name "*) ;;
+        *) echo "  -> $cond_name: not in CONDITIONS, skipping"; return ;;
+    esac
     local out_dir="$EVAL_ROOT/$cond_name"
     if [ -d "$out_dir" ] && ls "$out_dir"/episode_*.mp4 >/dev/null 2>&1; then
         echo "  -> $cond_name: already has videos; skipping (rm -rf to redo)"
