@@ -254,6 +254,12 @@ ever produced visible chopping (`rollout_logs/exp2_thr/episode_004.mp4`).
 
 ### Eval suite results
 
+> **Relocated 2026-06-16.** All eval/rollout outputs moved to
+> `evaluations/{paper,test}/` (see `evaluations/README.md`). The two canonical
+> 2×2 cells are now `evaluations/paper/clip_lang/` and `…/clip_nolang/`; the
+> recipe-sweep dirs + `comparison.*` are under
+> `evaluations/test/recipe_sweep/`. Paths below reflect the pre-move layout.
+
 Full per-action firing rate table + Wilson 95 % CI + pairwise Bonferroni-
 corrected z-tests + Cohen's h are at:
 - `output/evaluation/comparison.txt` (formatted)
@@ -361,9 +367,11 @@ This is the paper-grade 2×2 + R1 ablation.
   cross-model step-by-step comparison.
 - `scripts/eval_suite.sh <model_path> [tag] [base_seed]`: 4 prompt-
   conditions × 10 ep × 1000 steps, handles inference-server swap, writes
-  to `output/evaluation/<endtime>_<tag>/` with `manifest.json` (model SHA-1,
-  start/end time, decode flags, conditions).
-- `scripts/eval_compare.py`: walks `output/evaluation/*`, reports per-action
+  to `evaluations/test/<endtime>_<tag>/` by default (override
+  `EVAL_ROOT_BASE=evaluations/paper` for canonical 2×2 cells) with
+  `manifest.json` (model SHA-1, start/end time, decode flags, conditions).
+- `scripts/eval_compare.py`: walks `--root` (default `evaluations/paper`),
+  reports per-action
   firing rates + Wilson 95 % CI + pairwise Bonferroni-corrected z-tests +
   Cohen's h. Optional `--csv` output.
 - `feature_cache.HeadOnlyAgent(learnable_bce_temp=True)`: per-action

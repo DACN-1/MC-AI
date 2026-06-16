@@ -152,4 +152,5 @@ caches/
 output/
 output_cluster/
 rollouts/
+evaluations/
 debug/

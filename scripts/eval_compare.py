@@ -198,8 +198,10 @@ def discover_runs(root: Path) -> dict[str, Path]:
 
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--root", default="output/evaluation",
-                   help="Eval root (default output/evaluation; legacy output/eval/ also scanned)")
+    p.add_argument("--root", default="evaluations/paper",
+                   help="Eval root (default evaluations/paper = the canonical 2x2 cells; "
+                        "use --root evaluations/test/<family> for scratch runs; legacy "
+                        "output/eval/ is also always scanned)")
     p.add_argument("--models", nargs="*", default=None,
                    help="Model tags to compare; default = every run discovered under --root")
     p.add_argument("--conditions", nargs="*", default=CONDITIONS,

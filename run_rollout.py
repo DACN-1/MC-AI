@@ -478,8 +478,8 @@ def run(args: argparse.Namespace) -> None:
             # silently does not fire on log/dirt collection events in this
             # env config (confirmed by video: dirt visibly in HUD with
             # total_reward=0 across 1000 steps — see
-            # output/evaluation/20260608_161320_lang_slot30/D_dirt_task/
-            # episode_002.mp4). Log only nonzero items to keep file size sane.
+            # evaluations/test/recipe_sweep/20260608_161320_lang_slot30/
+            # D_dirt_task/episode_002.mp4). Log only nonzero items to keep file size sane.
             inv_snap = {}
             inv_obs = obs.get("inventory") if hasattr(obs, "get") else None
             if isinstance(inv_obs, dict):

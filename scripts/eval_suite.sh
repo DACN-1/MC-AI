@@ -42,7 +42,9 @@ DEVICE="${DEVICE:-mps}"
 # EVAL_ROOT_BASE to put runs elsewhere, or EVAL_ROOT to use a fixed dir
 # (skips the running/final rename — useful for resuming a partially-interrupted
 # suite). Legacy: setting EVAL_ROOT=output/eval/<tag> reproduces the old layout.
-EVAL_ROOT_BASE="${EVAL_ROOT_BASE:-output/evaluation}"
+# Default: exploratory runs land in evaluations/test/. For the canonical 2x2
+# paper cells, pass EVAL_ROOT_BASE=evaluations/paper explicitly.
+EVAL_ROOT_BASE="${EVAL_ROOT_BASE:-evaluations/test}"
 START_TS="$(date +%Y%m%d_%H%M%S)"
 if [ -z "${EVAL_ROOT:-}" ]; then
     RUNNING_DIR="$EVAL_ROOT_BASE/.running_${START_TS}_${MODEL_TAG}"
