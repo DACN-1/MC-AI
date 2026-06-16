@@ -115,10 +115,11 @@ back/jump/sprint/sneak/use F1 + camera mae. Key contrasts:
 
 ### 3b. Conditioning suite (primary behavioral instrument)
 
-For cells 1, 2, 4 (+5 if time): serve `model_best.pt` with
-`python inference_server.py --model-path <ckpt> --device cuda --port 8765`,
-then run the tested rollout path, 4 conditions × **10 episodes** × 1000
-steps, base seed 0:
+The **paper 2×2** = cells **#1 `llava_combined_lang_stride4_tsplit`** and
+**#2 `llava_combined_nolang_stride4_tsplit`** (the knob-free anchors that match
+the CLIP `clip_combined_{lang,nolang}_stride4` cells). Serve `model_best.pt` with
+`python inference_server.py --model-path <ckpt> --device cuda --port 8765`, then
+run 4 conditions × **10 episodes** × 1000 steps, base seed 0:
 
 | Condition | Env | Prompt |
 |---|---|---|
@@ -127,12 +128,32 @@ steps, base seed 0:
 | C_chop_task | MineRLChopATree640Fast-v0 | `"chop a tree"` |
 | D_dirt_task | MineRLCollectDirt640Fast-v0 | `"collect dirt"` |
 
-Plain greedy decode — NO `--sample` / thresholds / bias (all proven harmful
-on CLIP). `--color-match auto` always. Analyze with
-`scripts/eval_compare.py` (per-action firing rates, Wilson CIs, Bonferroni
-z-tests, camera tilt). The headline question: does LLaVA-lang shift
-behavior across prompts A/B/C while LLaVA-nolang stays flat (CLIP showed
-attack 82/71/29% vs flat ~61-66%)?
+**Decode — must match the CLIP cells exactly: `--sample --temperature 1.0
+--camera-temperature 2.0 --color-match auto`.** These are hardcoded in
+`scripts/eval_suite.sh` (lines 97-100) and are exactly what the existing CLIP
+paper cells used (their `manifest.json` records `sample=true, temp 1.0,
+cam-temp 2.0`). So the simplest correct path is to run the suite, which bakes in
+that decode and writes a `manifest.json` for `eval_compare.py`:
+
+```bash
+rm -f logs/minerl_watchers/*.pid
+EVAL_ROOT_BASE=evaluations/paper EPISODES=10 DEVICE=cuda \
+  bash scripts/eval_suite.sh output/llava_combined_lang_stride4_tsplit/model_best.pt   llava_lang   0
+EVAL_ROOT_BASE=evaluations/paper EPISODES=10 DEVICE=cuda \
+  bash scripts/eval_suite.sh output/llava_combined_nolang_stride4_tsplit/model_best.pt llava_nolang 0
+```
+
+⚠ **Do NOT use greedy decode here.** An earlier draft of this section said "plain
+greedy, NO --sample" — that is wrong and would silently break decode-symmetry
+against the already-run CLIP cells. The decode "proven harmful on CLIP" was the
+*aggressive* family (low attack thresholds, logit bias, high temperature), NOT
+this temp-1.0 sampling. If you bypass `eval_suite.sh` and call `run_rollout.py`
+directly, pass those four flags verbatim.
+
+Aggregate: `python scripts/eval_compare.py --models lang nolang llava_lang
+llava_nolang` (per-action firing rates, Wilson CIs, Bonferroni z-tests, camera
+tilt). Headline question: does LLaVA-lang shift attack across prompts A/B/C while
+LLaVA-nolang stays flat (CLIP showed attack 82/71/29% vs flat ~61-66%)?
 
 ### 3c. Reward (secondary, properly powered)
 
@@ -153,7 +174,8 @@ LLaVA's attack logit is also context-locked like CLIP's (never crosses 0.5)
 ```bash
 rsync -avz -e "ssh -p <port>" \
   root@<host>:/workspace/r1-va/output/{llava_*,clip_*tsplit_base*} output/
-rsync -avz -e "ssh -p <port>" root@<host>:/workspace/r1-va/<eval_out_dirs> output/eval_llava/
+# eval outputs land under evaluations/paper/ (llava_lang, llava_nolang):
+rsync -avz -e "ssh -p <port>" root@<host>:/workspace/r1-va/evaluations/paper/ evaluations/paper/
 ```
 
 ## 5. Acceptance checklist
