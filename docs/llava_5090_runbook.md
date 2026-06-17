@@ -64,7 +64,13 @@ for t in ['llava_combined_lang_stride4','llava_combined_nolang_stride4',
 # expect (1560750, 8192) for llava, (1560750, 1536) for clip
 ```
 
-## 2. Head trainings (8 runs, each minutes-fast on a 5090)
+## 2. Head trainings (9 runs, each minutes-fast on a 5090)
+
+> Executed 2026-06-12 **locally on an M1 Pro (MPS)**, not the 5090 — head
+> training is a tiny MLP on cached features (~15–30 min/run, $0), and the Mac's
+> 13 Mbps uplink made shipping the 57 GB of caches to a box impractical. Use
+> `--device mps --num-workers 0` locally (macOS `spawn` materialises the memmap
+> per worker → OOM at num_workers>0). The 5090 is now reserved for the eval phase.
 
 All via `cluster_pipeline.py` (cache exists → it skips the build and goes
 straight to `train_cached_head`; trajectory-level split is the default).
@@ -86,6 +92,19 @@ COMMON="--data-dir trajectories --cache-dir caches --output-dir output/<DIR> \
 | 6 | `llava_combined_lang_stride4_lr5e4_ep20` | `--backbone llava` | `--lr 5e-4 --epochs 20` (overrides COMMON) |
 | 7 | `clip_combined_lang_stride4_tsplit_base` | `--backbone clip` | (none — CLIP anchor under the honest split, missing from the Wave-3 batch) |
 | 8 | `clip_combined_nolang_stride4_tsplit_base` | `--backbone clip --no-language` | (none) |
+| 9 | `llava_combined_lang_stride4_lr5e4_cos40` | `--backbone llava` | `--lr 5e-4 --epochs 40 --lr-schedule cosine` (overrides COMMON; long-epoch probe — does LLaVA keep improving past 20 ep?) |
+
+> **Run 9 result (2026-06-12):** No. The cosine schedule damped the constant-LR
+> jitter and revealed a clean **plateau at ~0.43 val movement-F1 by epoch ~25**
+> (slope over ep21–40 = +0.0006/ep; `val_loss` flat at 0.613). Peak 0.4335@ep25 —
+> no better than the 20-epoch constant run (0.432) and still below CLIP's val
+> (0.452–0.455). So **cap LLaVA heads at ~20 epochs**; longer training only
+> asymptotes to a ceiling that sits at/under CLIP. NB on the *test* split the
+> backbone ranking is within noise and flips (LLaVA lr5e4 0.433 ≈ CLIP-nolang
+> 0.431 ≥ CLIP-lang 0.407 ≈ cos40 0.423) — the movement-F1 contrast is a wash,
+> so the decisive comparison is the §3b conditioning suite, not F1. The
+> `--lr-schedule {constant,cosine}` flag was added to `cluster_pipeline.py` /
+> `train_cached_head` (default constant, so runs 1–8 are unaffected).
 
 Example invocation (run #4):
 
@@ -102,24 +121,34 @@ Each run writes `model.pt`, `model_best.pt` (best val movement-F1 epoch) and
 `metrics.json` (test per-action F1). Per-epoch `val_movement_f1` /
 `val_per_action_f1` live in the checkpoint's `training_metrics`.
 
-## 3. Evals
+## 3. Evals — the 4 LLaVA rollouts (recipe × language 2×2, with control)
 
-### 3a. F1 table (free, immediate)
+**Why these 4 (and only 4).** The CLIP recipe screen (`docs/recipes.md`,
+2026-06-17, objective item-collection metric) established two things that scope
+the LLaVA spend:
+- **Chop is floor for every recipe** — no head completes a chop. Don't chase it.
+- **Dirt is the only task that works**, and `slot30_chop3` is the leading dirt
+  recipe (≈4.8 dirt/ep vs baseline 0 on CLIP).
 
-After training, assemble the per-action F1 comparison from each cell's
-`metrics.json`: rows = the 8 new cells, columns = attack/forward/left/right/
-back/jump/sprint/sneak/use F1 + camera mae. Key contrasts:
-- LLaVA-lang vs LLaVA-nolang (does language help F1 with the bigger backbone?)
-- LLaVA vs CLIP at matched recipe (backbone effect under identical knobs)
-- recipe deltas within LLaVA (do slot30/chop3 reproduce their CLIP F1 gains?)
+So the LLaVA rollouts are a single **recipe × language 2×2** that answers both
+open questions on the working task at once: does the dirt recipe beat the
+knob-free anchor on the bigger backbone, and does language conditioning hold?
 
-### 3b. Conditioning suite (primary behavioral instrument)
+| # | cell tag | head (serve `model_best.pt`) | role |
+|---|---|---|---|
+| 1 | `llava_lang` | `llava_combined_lang_stride4_tsplit` | anchor (knob-free), lang — recipe control |
+| 2 | `llava_nolang` | `llava_combined_nolang_stride4_tsplit` | **control** (no recipe, no language) |
+| 3 | `llava_slot30_chop3_lang` | `llava_combined_lang_stride4_slot30_chop3` | dirt recipe, lang |
+| 4 | `llava_slot30_chop3_nolang` | `llava_combined_nolang_stride4_slot30_chop3` | dirt recipe, nolang |
 
-The **paper 2×2** = cells **#1 `llava_combined_lang_stride4_tsplit`** and
-**#2 `llava_combined_nolang_stride4_tsplit`** (the knob-free anchors that match
-the CLIP `clip_combined_{lang,nolang}_stride4` cells). Serve `model_best.pt` with
-`python inference_server.py --model-path <ckpt> --device cuda --port 8765`, then
-run 4 conditions × **10 episodes** × 1000 steps, base seed 0:
+Cell **2 is the control**; rows 1↔3 isolate the recipe effect, {1,3}↔{2,4} isolate
+language. All four heads are already trained (`model.pt` + `model_best.pt`).
+
+### Protocol (identical across all 4)
+
+Full `eval_suite`: 4 conditions × **10 ep × 1000 steps**, base seed 0. Serve
+`model_best.pt` on the 5090 (`inference_server.py --device cuda`); the container
+connects via `--remote-agent`. `eval_suite.sh` handles the server swap.
 
 | Condition | Env | Prompt |
 |---|---|---|
@@ -128,46 +157,41 @@ run 4 conditions × **10 episodes** × 1000 steps, base seed 0:
 | C_chop_task | MineRLChopATree640Fast-v0 | `"chop a tree"` |
 | D_dirt_task | MineRLCollectDirt640Fast-v0 | `"collect dirt"` |
 
-**Decode — must match the CLIP cells exactly: `--sample --temperature 1.0
---camera-temperature 2.0 --color-match auto`.** These are hardcoded in
-`scripts/eval_suite.sh` (lines 97-100) and are exactly what the existing CLIP
-paper cells used (their `manifest.json` records `sample=true, temp 1.0,
-cam-temp 2.0`). So the simplest correct path is to run the suite, which bakes in
-that decode and writes a `manifest.json` for `eval_compare.py`:
+**Decode = sampled: `--sample --temperature 1.0 --camera-temperature 2.0
+--color-match auto`** (hardcoded in `eval_suite.sh`, matches the CLIP cells).
+⚠ Do NOT switch to greedy — it would break decode-symmetry vs the CLIP cells.
 
 ```bash
 rm -f logs/minerl_watchers/*.pid
-EVAL_ROOT_BASE=evaluations/paper EPISODES=10 DEVICE=cuda \
-  bash scripts/eval_suite.sh output/llava_combined_lang_stride4_tsplit/model_best.pt   llava_lang   0
-EVAL_ROOT_BASE=evaluations/paper EPISODES=10 DEVICE=cuda \
-  bash scripts/eval_suite.sh output/llava_combined_nolang_stride4_tsplit/model_best.pt llava_nolang 0
+EVAL_ROOT_BASE=evaluations/paper EPISODES=10 DEVICE=cuda bash scripts/eval_suite.sh output/llava_combined_lang_stride4_tsplit/model_best.pt           llava_lang                0
+EVAL_ROOT_BASE=evaluations/paper EPISODES=10 DEVICE=cuda bash scripts/eval_suite.sh output/llava_combined_nolang_stride4_tsplit/model_best.pt         llava_nolang              0
+EVAL_ROOT_BASE=evaluations/paper EPISODES=10 DEVICE=cuda bash scripts/eval_suite.sh output/llava_combined_lang_stride4_slot30_chop3/model_best.pt     llava_slot30_chop3_lang   0
+EVAL_ROOT_BASE=evaluations/paper EPISODES=10 DEVICE=cuda bash scripts/eval_suite.sh output/llava_combined_nolang_stride4_slot30_chop3/model_best.pt   llava_slot30_chop3_nolang 0
 ```
 
-⚠ **Do NOT use greedy decode here.** An earlier draft of this section said "plain
-greedy, NO --sample" — that is wrong and would silently break decode-symmetry
-against the already-run CLIP cells. The decode "proven harmful on CLIP" was the
-*aggressive* family (low attack thresholds, logit bias, high temperature), NOT
-this temp-1.0 sampling. If you bypass `eval_suite.sh` and call `run_rollout.py`
-directly, pass those four flags verbatim.
+### Metrics (both come straight out of `run_summary.json`)
 
-Aggregate: `python scripts/eval_compare.py --models lang nolang llava_lang
-llava_nolang` (per-action firing rates, Wilson CIs, Bonferroni z-tests, camera
-tilt). Headline question: does LLaVA-lang shift attack across prompts A/B/C while
-LLaVA-nolang stays flat (CLIP showed attack 82/71/29% vs flat ~61-66%)?
+1. **PRIMARY — task performance (dirt):** `mean_peak_inventory["dirt"]` +
+   `collect_rate`, the reward-independent item count (the env reward was broken;
+   `docs/recipes.md`). `total_reward` is now also correct (wrapper fixed) and
+   should agree. *Q: does `slot30_chop3` beat the anchor on dirt for LLaVA, and
+   does it match/beat CLIP `slot30_chop3`?*
+2. **SECONDARY — conditioning:** per-action firing rates across A/B/C via
+   `eval_compare.py` (Wilson CIs, Bonferroni z-tests, camera tilt). *Q: does
+   `llava_lang` shift attack across prompts while `llava_nolang` stays flat?*
+   (CLIP showed attack 82/71/29 % vs flat ~61–66 %.)
+3. **Chop:** expect 0 logs for all — report it as the negative result, don't tune
+   for it.
 
-### 3c. Reward (secondary, properly powered)
-
-D_dirt_task only, cells 1 and 4: **20 episodes** (`--episodes 20 --seed 100`,
-fresh env per run if the harness allows). Report mean ± per-episode spread.
-Do NOT compare against the historical 4.60 (known unreliable); compare cells
-against each other within this same session.
-
-### 3d. Chop behavioral check (no reward expected)
-
-From C_chop_task steps_*.json: attack firing rate, mean sustained-attack run
-length, camera-y distribution. Expect reward 0; what matters is whether
-LLaVA's attack logit is also context-locked like CLIP's (never crosses 0.5)
-— grep `action_vec[0]` (attack logit) percentiles.
+Aggregate:
+```bash
+python scripts/eval_compare.py --models llava_lang llava_nolang llava_slot30_chop3_lang llava_slot30_chop3_nolang
+python scripts/rank_item_collection.py evaluations/paper
+```
+For the **backbone** contrast, also pull the matched CLIP cells (`lang`, `nolang`,
+`clip ... slot30_chop3`) into the same compare. *(Free pre-check: the per-action
+F1 table from each cell's `metrics.json` — attack/forward/.../camera-mae — gives
+an immediate read before spending rollout time.)*
 
 ## 4. Pull artifacts back to the Mac
 
