@@ -35,17 +35,18 @@ profiles — plus the mandatory knob-free 2×2 anchor.
   MineRL docker client connects with `--remote-agent <host>:8765`; the
   JPEG+keep-alive transport handles the tunnel).
 
-## 1. Stage data (push FROM the Mac; cluster no longer has the caches)
+## 1. Stage data (push FROM the Mac)
 
-Head training needs ONLY caches + all_actions.json — no videos.
+This book covers **only the 2 LLaVA caches** — `{lang,nolang}`. The CLIP half of
+the study (its 2 caches → 4-recipe heads → 4-way eval) runs **locally on the Mac**
+(CLIP fits), so don't ship the CLIP caches to the box. Head training needs ONLY
+the caches + `all_actions.json` — no videos.
 
 ```bash
-# from the Mac repo root (~60 GB total, ~30 min):
+# from the Mac repo root (~40 GB, ~20 min):
 rsync -a --partial --progress -e "ssh -p <port>" \
   caches/llava_combined_lang_stride4.{npy,json} \
   caches/llava_combined_nolang_stride4.{npy,json} \
-  caches/clip_combined_lang_stride4.{npy,json} \
-  caches/clip_combined_nolang_stride4.{npy,json} \
   root@<host>:/workspace/r1-va/caches/
 rsync -a -e "ssh -p <port>" --relative \
   trajectories/./trajectory_task_chop_a_tree_length_3000/all_actions.json \
@@ -58,158 +59,157 @@ Sanity check on the box before training:
 ```bash
 python -c "
 from feature_cache import load_cache
-for t in ['llava_combined_lang_stride4','llava_combined_nolang_stride4',
-          'clip_combined_lang_stride4','clip_combined_nolang_stride4']:
+for t in ['llava_combined_lang_stride4','llava_combined_nolang_stride4']:
     f,m = load_cache('caches', t); print(t, f.shape, m['backbone'], m['use_language'])"
-# expect (1560750, 8192) for llava, (1560750, 1536) for clip
+# expect (1560750, 8192) for each LLaVA cache
 ```
 
-## 2. Head trainings (9 runs, each minutes-fast on a 5090)
+## 2. Head trainings — 8 LLaVA heads (2 caches × 4 recipes)
 
-> Executed 2026-06-12 **locally on an M1 Pro (MPS)**, not the 5090 — head
-> training is a tiny MLP on cached features (~15–30 min/run, $0), and the Mac's
-> 13 Mbps uplink made shipping the 57 GB of caches to a box impractical. Use
-> `--device mps --num-workers 0` locally (macOS `spawn` materialises the memmap
-> per worker → OOM at num_workers>0). The 5090 is now reserved for the eval phase.
+**The 4 recipes** (chosen from the CLIP item-collection screen, `docs/recipes.md`;
+chop is floor for all, so these are the dirt leaders + the knob-free anchor as the
+in-cell control):
 
-All via `cluster_pipeline.py` (cache exists → it skips the build and goes
-straight to `train_cached_head`; trajectory-level split is the default).
-Common flags:
+| recipe | role | recipe flags |
+|---|---|---|
+| `anchor` (tsplit) | in-cell control (knob-free) | (none) |
+| `slot30_chop3` | dirt leader | `--past-action-slot-dropout 0.3 --chop-oversample-weight 3.0` |
+| `r3c_minrun300` | dirt (frame-weighted) | `--history-dropout 0.5 --frame-weight-multiplier 5.0 --frame-weight-min-run 300 --learnable-bce-temp` |
+| `slot50` | dirt (heavy slot-dropout; only CLIP cell to ever complete a chop) | `--past-action-slot-dropout 0.5` |
+
+Train each recipe on **both** LLaVA caches (`--backbone llava` lang, and
+`--backbone llava --no-language` nolang) → 8 heads. **4 already exist; 4 to train:**
+
+| head (`output/...`) | recipe | status |
+|---|---|---|
+| `llava_combined_lang_stride4_tsplit` | anchor · lang | ✅ exists |
+| `llava_combined_nolang_stride4_tsplit` | anchor · nolang | ✅ exists |
+| `llava_combined_lang_stride4_slot30_chop3` | slot30_chop3 · lang | ✅ exists |
+| `llava_combined_nolang_stride4_slot30_chop3` | slot30_chop3 · nolang | ✅ exists |
+| `llava_combined_lang_stride4_r3c_minrun300` | r3c · lang | ⬜ train |
+| `llava_combined_nolang_stride4_r3c_minrun300` | r3c · nolang | ⬜ train |
+| `llava_combined_lang_stride4_slot50` | slot50 · lang | ⬜ train |
+| `llava_combined_nolang_stride4_slot50` | slot50 · nolang | ⬜ train |
+
+> Head training is a tiny MLP on cached features (~15–30 min/run, $0) — run it
+> **locally on MPS** (`--device mps --num-workers 0`; macOS `spawn` OOMs at
+> workers>0) **or** on the box. **Cap epochs at ~20**: a cosine long-epoch probe
+> (lr5e4 ep40) plateaued at ~0.43 val movement-F1 by ep25, no better than 20 ep
+> and at/under CLIP — and test-split F1 across backbones is within noise, so the
+> decisive comparison is the **rollout eval (§3), not F1**.
+
+All via `cluster_pipeline.py` (cache present → skips build, goes straight to
+`train_cached_head`; trajectory split + keep-best is the cohort default):
 
 ```bash
-COMMON="--data-dir trajectories --cache-dir caches --output-dir output/<DIR> \
-  --device cuda --epochs 10 --batch-size 256 --lr 1e-3 --num-workers 8 \
+COMMON="--data-dir trajectories --cache-dir caches --device cuda \
+  --epochs 10 --batch-size 256 --lr 1e-3 --num-workers 8 \
   --past-action-k 8 --chunk-size 8 --frame-stride 4 --hidden-dim 2048 --keep-best"
-```
 
-| # | Output dir (`output/...`) | Backbone flags | Recipe flags |
-|---|---|---|---|
-| 1 | `llava_combined_lang_stride4_tsplit` | `--backbone llava` | (none — 2×2 anchor) |
-| 2 | `llava_combined_nolang_stride4_tsplit` | `--backbone llava --no-language` | (none — 2×2 anchor) |
-| 3 | `llava_combined_lang_stride4_slot30` | `--backbone llava` | `--past-action-slot-dropout 0.3` |
-| 4 | `llava_combined_lang_stride4_slot30_chop3` | `--backbone llava` | `--past-action-slot-dropout 0.3 --chop-oversample-weight 3.0` |
-| 5 | `llava_combined_nolang_stride4_slot30_chop3` | `--backbone llava --no-language` | `--past-action-slot-dropout 0.3 --chop-oversample-weight 3.0` |
-| 6 | `llava_combined_lang_stride4_lr5e4_ep20` | `--backbone llava` | `--lr 5e-4 --epochs 20` (overrides COMMON) |
-| 7 | `clip_combined_lang_stride4_tsplit_base` | `--backbone clip` | (none — CLIP anchor under the honest split, missing from the Wave-3 batch) |
-| 8 | `clip_combined_nolang_stride4_tsplit_base` | `--backbone clip --no-language` | (none) |
-| 9 | `llava_combined_lang_stride4_lr5e4_cos40` | `--backbone llava` | `--lr 5e-4 --epochs 40 --lr-schedule cosine` (overrides COMMON; long-epoch probe — does LLaVA keep improving past 20 ep?) |
+# r3c_minrun300 (lang + nolang)
+python cluster_pipeline.py $COMMON --backbone llava \
+  --output-dir output/llava_combined_lang_stride4_r3c_minrun300 \
+  --history-dropout 0.5 --frame-weight-multiplier 5.0 --frame-weight-min-run 300 --learnable-bce-temp
+python cluster_pipeline.py $COMMON --backbone llava --no-language \
+  --output-dir output/llava_combined_nolang_stride4_r3c_minrun300 \
+  --history-dropout 0.5 --frame-weight-multiplier 5.0 --frame-weight-min-run 300 --learnable-bce-temp
 
-> **Run 9 result (2026-06-12):** No. The cosine schedule damped the constant-LR
-> jitter and revealed a clean **plateau at ~0.43 val movement-F1 by epoch ~25**
-> (slope over ep21–40 = +0.0006/ep; `val_loss` flat at 0.613). Peak 0.4335@ep25 —
-> no better than the 20-epoch constant run (0.432) and still below CLIP's val
-> (0.452–0.455). So **cap LLaVA heads at ~20 epochs**; longer training only
-> asymptotes to a ceiling that sits at/under CLIP. NB on the *test* split the
-> backbone ranking is within noise and flips (LLaVA lr5e4 0.433 ≈ CLIP-nolang
-> 0.431 ≥ CLIP-lang 0.407 ≈ cos40 0.423) — the movement-F1 contrast is a wash,
-> so the decisive comparison is the §3b conditioning suite, not F1. The
-> `--lr-schedule {constant,cosine}` flag was added to `cluster_pipeline.py` /
-> `train_cached_head` (default constant, so runs 1–8 are unaffected).
-
-Example invocation (run #4):
-
-```bash
-python cluster_pipeline.py --data-dir trajectories --cache-dir caches \
-  --output-dir output/llava_combined_lang_stride4_slot30_chop3 \
-  --backbone llava --device cuda --epochs 10 --batch-size 256 --lr 1e-3 \
-  --num-workers 8 --past-action-k 8 --chunk-size 8 --frame-stride 4 \
-  --hidden-dim 2048 --keep-best \
-  --past-action-slot-dropout 0.3 --chop-oversample-weight 3.0
+# slot50 (lang + nolang)
+python cluster_pipeline.py $COMMON --backbone llava \
+  --output-dir output/llava_combined_lang_stride4_slot50 \
+  --past-action-slot-dropout 0.5
+python cluster_pipeline.py $COMMON --backbone llava --no-language \
+  --output-dir output/llava_combined_nolang_stride4_slot50 \
+  --past-action-slot-dropout 0.5
 ```
 
 Each run writes `model.pt`, `model_best.pt` (best val movement-F1 epoch) and
-`metrics.json` (test per-action F1). Per-epoch `val_movement_f1` /
-`val_per_action_f1` live in the checkpoint's `training_metrics`.
+`metrics.json`. Serve `model_best.pt` for the evals.
 
-## 3. Evals — the 4 LLaVA rollouts (recipe × language 2×2, with control)
+## 3. Evals — two 4-way recipe evals (one per LLaVA cache)
 
-**Why these 4 (and only 4).** The CLIP recipe screen (`docs/recipes.md`,
-2026-06-17, objective item-collection metric) established two things that scope
-the LLaVA spend:
-- **Chop is floor for every recipe** — no head completes a chop. Don't chase it.
-- **Dirt is the only task that works**, and `slot30_chop3` is the leading dirt
-  recipe (≈4.8 dirt/ep vs baseline 0 on CLIP).
+Each LLaVA cache's 4 heads compete in a **4-way recipe eval**: `anchor` (control)
+vs `slot30_chop3` vs `r3c_minrun300` vs `slot50`. Run it for both caches → 8
+rollout runs. (The CLIP half — the same two 4-way evals on the CLIP caches — runs
+locally on the Mac; together the four 4-ways give the full backbone × language ×
+recipe picture.)
 
-So the LLaVA rollouts are a single **recipe × language 2×2** that answers both
-open questions on the working task at once: does the dirt recipe beat the
-knob-free anchor on the bigger backbone, and does language conditioning hold?
+Why this scope: the CLIP item-collection screen (`docs/recipes.md`) found **chop
+is floor for every recipe** (don't chase it) and **dirt is the only working task**;
+these 4 are the dirt leaders + the knob-free control.
 
-| # | cell tag | head (serve `model_best.pt`) | role |
-|---|---|---|---|
-| 1 | `llava_lang` | `llava_combined_lang_stride4_tsplit` | anchor (knob-free), lang — recipe control |
-| 2 | `llava_nolang` | `llava_combined_nolang_stride4_tsplit` | **control** (no recipe, no language) |
-| 3 | `llava_slot30_chop3_lang` | `llava_combined_lang_stride4_slot30_chop3` | dirt recipe, lang |
-| 4 | `llava_slot30_chop3_nolang` | `llava_combined_nolang_stride4_slot30_chop3` | dirt recipe, nolang |
+| 4-way eval | cache | tags (anchor / slot30_chop3 / r3c / slot50) |
+|---|---|---|
+| **LLaVA-lang** | `llava_combined_lang_stride4` | `llava_lang_anchor` `llava_lang_slot30_chop3` `llava_lang_r3c` `llava_lang_slot50` |
+| **LLaVA-nolang** | `llava_combined_nolang_stride4` | `llava_nolang_anchor` `llava_nolang_slot30_chop3` `llava_nolang_r3c` `llava_nolang_slot50` |
 
-Cell **2 is the control**; rows 1↔3 isolate the recipe effect, {1,3}↔{2,4} isolate
-language. All four heads are already trained (`model.pt` + `model_best.pt`).
-
-### Protocol (identical across all 4)
+### Protocol (identical across all 8 runs)
 
 Full `eval_suite`: 4 conditions × **10 ep × 1000 steps**, base seed 0. Serve
 `model_best.pt` on the 5090 (`inference_server.py --device cuda`); the container
-connects via `--remote-agent`. `eval_suite.sh` handles the server swap.
-
-| Condition | Env | Prompt |
-|---|---|---|
-| A_chop_nocap | MineRLChopATree640Fast-v0 | `""` |
-| B_chop_ood | MineRLChopATree640Fast-v0 | `"Play Minecraft."` |
-| C_chop_task | MineRLChopATree640Fast-v0 | `"chop a tree"` |
-| D_dirt_task | MineRLCollectDirt640Fast-v0 | `"collect dirt"` |
-
-**Decode = sampled: `--sample --temperature 1.0 --camera-temperature 2.0
---color-match auto`** (hardcoded in `eval_suite.sh`, matches the CLIP cells).
-⚠ Do NOT switch to greedy — it would break decode-symmetry vs the CLIP cells.
+connects via `--remote-agent`. **Decode = sampled** (`--sample --temperature 1.0
+--camera-temperature 2.0 --color-match auto`, hardcoded in `eval_suite.sh`, matches
+the CLIP cells — do NOT switch to greedy). Conditions: A_chop_nocap (`""`),
+B_chop_ood (`"Play Minecraft."`), C_chop_task (`"chop a tree"`) on
+`MineRLChopATree640Fast-v0`; D_dirt_task (`"collect dirt"`) on
+`MineRLCollectDirt640Fast-v0`.
 
 ```bash
 rm -f logs/minerl_watchers/*.pid
-EVAL_ROOT_BASE=evaluations/paper EPISODES=10 DEVICE=cuda bash scripts/eval_suite.sh output/llava_combined_lang_stride4_tsplit/model_best.pt           llava_lang                0
-EVAL_ROOT_BASE=evaluations/paper EPISODES=10 DEVICE=cuda bash scripts/eval_suite.sh output/llava_combined_nolang_stride4_tsplit/model_best.pt         llava_nolang              0
-EVAL_ROOT_BASE=evaluations/paper EPISODES=10 DEVICE=cuda bash scripts/eval_suite.sh output/llava_combined_lang_stride4_slot30_chop3/model_best.pt     llava_slot30_chop3_lang   0
-EVAL_ROOT_BASE=evaluations/paper EPISODES=10 DEVICE=cuda bash scripts/eval_suite.sh output/llava_combined_nolang_stride4_slot30_chop3/model_best.pt   llava_slot30_chop3_nolang 0
+run() { EVAL_ROOT_BASE=evaluations/paper EPISODES=10 DEVICE=cuda \
+        bash scripts/eval_suite.sh "output/$1/model_best.pt" "$2" 0; }
+
+# --- LLaVA-lang 4-way ---
+run llava_combined_lang_stride4_tsplit          llava_lang_anchor
+run llava_combined_lang_stride4_slot30_chop3    llava_lang_slot30_chop3
+run llava_combined_lang_stride4_r3c_minrun300   llava_lang_r3c
+run llava_combined_lang_stride4_slot50          llava_lang_slot50
+# --- LLaVA-nolang 4-way ---
+run llava_combined_nolang_stride4_tsplit        llava_nolang_anchor
+run llava_combined_nolang_stride4_slot30_chop3  llava_nolang_slot30_chop3
+run llava_combined_nolang_stride4_r3c_minrun300 llava_nolang_r3c
+run llava_combined_nolang_stride4_slot50        llava_nolang_slot50
 ```
 
-### Metrics (both come straight out of `run_summary.json`)
+### Metrics (straight out of `run_summary.json`)
 
 1. **PRIMARY — task performance (dirt):** `mean_peak_inventory["dirt"]` +
-   `collect_rate`, the reward-independent item count (the env reward was broken;
-   `docs/recipes.md`). `total_reward` is now also correct (wrapper fixed) and
-   should agree. *Q: does `slot30_chop3` beat the anchor on dirt for LLaVA, and
-   does it match/beat CLIP `slot30_chop3`?*
-2. **SECONDARY — conditioning:** per-action firing rates across A/B/C via
-   `eval_compare.py` (Wilson CIs, Bonferroni z-tests, camera tilt). *Q: does
-   `llava_lang` shift attack across prompts while `llava_nolang` stays flat?*
-   (CLIP showed attack 82/71/29 % vs flat ~61–66 %.)
-3. **Chop:** expect 0 logs for all — report it as the negative result, don't tune
-   for it.
+   `collect_rate` (reward-independent; the env reward was broken — `docs/recipes.md`).
+   `total_reward` is now also correct (wrapper fixed). *Within each cache: which
+   recipe digs most, and does any beat the `anchor` control?*
+2. **Conditioning (cross-cache):** compare the LLaVA-lang vs LLaVA-nolang 4-ways —
+   per-action firing rates across A/B/C via `eval_compare.py`. *Does lang shift
+   attack across prompts while nolang stays flat?* (CLIP: 82/71/29 % vs ~61–66 %.)
+3. **Chop:** expect 0 logs for all — the negative result; don't tune for it.
 
-Aggregate:
+Aggregate (one compare per 4-way, then cross to CLIP):
 ```bash
-python scripts/eval_compare.py --models llava_lang llava_nolang llava_slot30_chop3_lang llava_slot30_chop3_nolang
+python scripts/eval_compare.py --root evaluations/paper --models llava_lang_anchor llava_lang_slot30_chop3 llava_lang_r3c llava_lang_slot50
+python scripts/eval_compare.py --root evaluations/paper --models llava_nolang_anchor llava_nolang_slot30_chop3 llava_nolang_r3c llava_nolang_slot50
 python scripts/rank_item_collection.py evaluations/paper
 ```
-For the **backbone** contrast, also pull the matched CLIP cells (`lang`, `nolang`,
-`clip ... slot30_chop3`) into the same compare. *(Free pre-check: the per-action
-F1 table from each cell's `metrics.json` — attack/forward/.../camera-mae — gives
-an immediate read before spending rollout time.)*
+Pre-check before rollouts: the per-action F1 table from each head's `metrics.json`
+gives an immediate read (but the decision is the dirt rollout, not F1).
 
 ## 4. Pull artifacts back to the Mac
 
 ```bash
+# the 4 newly-trained LLaVA heads (r3c, slot50 × lang/nolang):
 rsync -avz -e "ssh -p <port>" \
-  root@<host>:/workspace/r1-va/output/{llava_*,clip_*tsplit_base*} output/
-# eval outputs land under evaluations/paper/ (llava_lang, llava_nolang):
+  root@<host>:/workspace/r1-va/output/llava_combined_*_stride4_{r3c_minrun300,slot50} output/
+# the 8 rollout-eval dirs:
 rsync -avz -e "ssh -p <port>" root@<host>:/workspace/r1-va/evaluations/paper/ evaluations/paper/
 ```
 
 ## 5. Acceptance checklist
 
-- [ ] 8/8 trainings completed with `model_best.pt` + `metrics.json`
-- [ ] F1 table assembled (3a) with the three contrasts
-- [ ] Conditioning suite: 10 eps × 4 conditions for cells 1, 2, 4
-- [ ] eval_compare stats generated (firing rates + CIs + z-tests)
-- [ ] 20-ep dirt reward for cells 1 and 4
-- [ ] Attack-logit percentile analysis on chop (3d)
+- [ ] 4 new heads trained (`r3c_minrun300`, `slot50` × lang/nolang) →
+      `model_best.pt` + `metrics.json` (the 4 others already exist)
+- [ ] 8 rollout evals done (2 caches × 4 recipes), 10 ep × 4 conditions
+- [ ] Two 4-way `eval_compare` runs (LLaVA-lang, LLaVA-nolang) — dirt item counts
+- [ ] `rank_item_collection.py evaluations/paper` shows the per-cache recipe ranking
+- [ ] Cross-cache conditioning read (lang vs nolang firing rates A/B/C)
+- [ ] Chop confirmed at floor (negative result recorded)
 - [ ] Everything rsync'd back; box destroyed only after checksums verified
 
 Budget: trainings <1 GPU-h total; evals dominated by MineRL wall-clock
