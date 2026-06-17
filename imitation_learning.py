@@ -230,9 +230,6 @@ class TrajectoryDataset(Dataset):
         past = self._past_actions(stem, frame_idx)
         return Image.fromarray(frame_array), task_text, target_chunk, past
 
-    def get_stats(self) -> dict:
-        return {"total_samples": len(self.samples)}
-
 
 # ---------------------------------------------------------------------
 # Loss
