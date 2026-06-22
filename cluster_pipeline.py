@@ -288,6 +288,24 @@ def main():
         "with --frame-weight-multiplier. Cache-safe.",
     )
     parser.add_argument(
+        "--feature-norm",
+        action="store_true",
+        help="Post-cache fix A: LayerNorm the frozen feature vector before the "
+        "head. Equalizes the very different per-dim scales of image_pool vs "
+        "text_pool so the probe stops ignoring the (low-variance) language "
+        "channel. Active at rollout too. Cache-safe.",
+    )
+    parser.add_argument(
+        "--image-dropout",
+        type=float,
+        default=0.0,
+        help="Post-cache fix B: with this probability, zero the image half of "
+        "the cached feature during training so the head must read the task from "
+        "text_pool — breaks the image-as-task-id shortcut that leaves language "
+        "unused. Train-time only (no-op at rollout). 0.0 = off; 0.25 typical. "
+        "Cache-safe.",
+    )
+    parser.add_argument(
         "--cam-weighted-loss",
         action="store_true",
         help="Enable ONLY the camera CE class weights (cam_weight), NOT the "
@@ -484,6 +502,8 @@ def main():
                 frame_weight_multiplier=args.frame_weight_multiplier,
                 frame_weight_min_run=args.frame_weight_min_run,
                 learnable_bce_temp=args.learnable_bce_temp,
+                feature_norm=args.feature_norm,
+                image_dropout=args.image_dropout,
                 focal_gamma=args.focal_gamma,
                 past_action_slot_dropout=args.past_action_slot_dropout,
                 chop_oversample_weight=args.chop_oversample_weight,
@@ -518,6 +538,7 @@ def main():
                 chunk_size=chunk_size,
                 hidden_dim=cfg.get("hidden_dim"),
                 learnable_bce_temp=cfg.get("learnable_bce_temp", False),
+                feature_norm=cfg.get("feature_norm", False),
             ).to(args.device)
             model.load_state_dict(ckpt["state_dict"])
             test_size = int(len(dataset) * 0.1)

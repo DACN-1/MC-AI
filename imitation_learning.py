@@ -945,6 +945,8 @@ def train_cached_head(
     frame_weight_multiplier: float = 1.0,
     frame_weight_min_run: int = 60,
     learnable_bce_temp: bool = False,
+    feature_norm: bool = False,
+    image_dropout: float = 0.0,
     focal_gamma: float = 0.0,
     past_action_slot_dropout: float = 0.0,
     chop_oversample_weight: float = 1.0,
@@ -1116,6 +1118,13 @@ def train_cached_head(
         print(f"Focal BCE ON — gamma={focal_gamma}")
     if past_action_slot_dropout > 0:
         print(f"Past-action per-slot dropout ON — p={past_action_slot_dropout}")
+    if feature_norm:
+        print("Input feature LayerNorm ON (post-cache fix A)")
+    if image_dropout > 0:
+        print(
+            f"Image-pool dropout ON — p={image_dropout} (post-cache fix B; "
+            f"image_dim={dataset.feature_dim() // 2})"
+        )
 
     train_loader = DataLoader(
         train_set,
@@ -1143,6 +1152,8 @@ def train_cached_head(
         chunk_size=chunk_size,
         hidden_dim=hidden_dim,
         learnable_bce_temp=learnable_bce_temp,
+        feature_norm=feature_norm,
+        image_dropout=image_dropout,
     ).to(device)
     optim = th.optim.Adam(model.parameters(), lr=lr)
 
@@ -1190,6 +1201,8 @@ def train_cached_head(
                     "frame_weight_multiplier": frame_weight_multiplier,
                     "frame_weight_min_run": frame_weight_min_run,
                     "learnable_bce_temp": learnable_bce_temp,
+                    "feature_norm": feature_norm,
+                    "image_dropout": image_dropout,
                     "focal_gamma": focal_gamma,
                     "past_action_slot_dropout": past_action_slot_dropout,
                     "chop_oversample_weight": chop_oversample_weight,
