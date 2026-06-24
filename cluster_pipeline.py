@@ -306,6 +306,15 @@ def main():
         "Cache-safe.",
     )
     parser.add_argument(
+        "--film",
+        action="store_true",
+        help="Post-cache fix C: FiLM conditioning. text_pool generates per-channel "
+        "scale/shift (gamma/beta) that modulate image_pool; the MLP consumes only "
+        "the modulated image, so text is structurally injected (can't be ignored "
+        "like in a concat). Pair with --image-dropout so beta(text) carries the "
+        "task signal. Active at rollout. Cache-safe.",
+    )
+    parser.add_argument(
         "--cam-weighted-loss",
         action="store_true",
         help="Enable ONLY the camera CE class weights (cam_weight), NOT the "
@@ -504,6 +513,7 @@ def main():
                 learnable_bce_temp=args.learnable_bce_temp,
                 feature_norm=args.feature_norm,
                 image_dropout=args.image_dropout,
+                film=args.film,
                 focal_gamma=args.focal_gamma,
                 past_action_slot_dropout=args.past_action_slot_dropout,
                 chop_oversample_weight=args.chop_oversample_weight,
@@ -539,6 +549,7 @@ def main():
                 hidden_dim=cfg.get("hidden_dim"),
                 learnable_bce_temp=cfg.get("learnable_bce_temp", False),
                 feature_norm=cfg.get("feature_norm", False),
+                film=cfg.get("film", False),
             ).to(args.device)
             model.load_state_dict(ckpt["state_dict"])
             test_size = int(len(dataset) * 0.1)

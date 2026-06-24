@@ -100,10 +100,11 @@ def _load_cached_head_agent(ckpt: dict, cfg: dict, device: str):
         chunk_size=chunk_size,
         hidden_dim=hidden_dim,
         learnable_bce_temp=cfg.get("learnable_bce_temp", False),
-        # fix A (LayerNorm) is an active inference module — must be rebuilt so the
-        # state_dict keys match. fix B (image_dropout) is train-only, so it stays
-        # off here (eval() makes it a no-op regardless).
+        # fix A (LayerNorm) and fix C (FiLM) are active inference modules — must be
+        # rebuilt so the state_dict keys match. fix B (image_dropout) is train-only,
+        # so it stays off here (eval() makes it a no-op regardless).
         feature_norm=cfg.get("feature_norm", False),
+        film=cfg.get("film", False),
     )
     head.load_state_dict(ckpt["state_dict"])
 

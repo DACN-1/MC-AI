@@ -947,6 +947,7 @@ def train_cached_head(
     learnable_bce_temp: bool = False,
     feature_norm: bool = False,
     image_dropout: float = 0.0,
+    film: bool = False,
     focal_gamma: float = 0.0,
     past_action_slot_dropout: float = 0.0,
     chop_oversample_weight: float = 1.0,
@@ -1125,6 +1126,11 @@ def train_cached_head(
             f"Image-pool dropout ON — p={image_dropout} (post-cache fix B; "
             f"image_dim={dataset.feature_dim() // 2})"
         )
+    if film:
+        print(
+            "FiLM conditioning ON (post-cache fix C) — text modulates image "
+            "(gamma/beta), MLP consumes modulated image only"
+        )
 
     train_loader = DataLoader(
         train_set,
@@ -1154,6 +1160,7 @@ def train_cached_head(
         learnable_bce_temp=learnable_bce_temp,
         feature_norm=feature_norm,
         image_dropout=image_dropout,
+        film=film,
     ).to(device)
     optim = th.optim.Adam(model.parameters(), lr=lr)
 
@@ -1203,6 +1210,7 @@ def train_cached_head(
                     "learnable_bce_temp": learnable_bce_temp,
                     "feature_norm": feature_norm,
                     "image_dropout": image_dropout,
+                    "film": film,
                     "focal_gamma": focal_gamma,
                     "past_action_slot_dropout": past_action_slot_dropout,
                     "chop_oversample_weight": chop_oversample_weight,

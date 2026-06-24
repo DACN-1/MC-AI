@@ -531,6 +531,7 @@ class HeadOnlyAgent(th.nn.Module):
         feature_norm: bool = False,
         image_dropout: float = 0.0,
         image_feature_dim: int | None = None,
+        film: bool = False,
     ):
         super().__init__()
         self.feature_dim = feature_dim
@@ -539,29 +540,58 @@ class HeadOnlyAgent(th.nn.Module):
         self.chunk_size = chunk_size
         self.hidden_dim = hidden_dim or feature_dim
         self.learnable_bce_temp = learnable_bce_temp
-        # Post-cache fix A: LayerNorm the frozen feature block before the probe.
-        # LLaVA's 8192-d mean-pooled features arrive on very different per-dim
-        # scales (image_pool is a mean over ~576 tokens, text_pool over a handful),
-        # so an un-normalized first Linear is dominated by the high-variance image
-        # dims and effectively ignores text — part of why language never moves the
-        # policy. A LayerNorm with learnable affine puts the two halves on equal
-        # footing. Applied to the cached feature only; past-action one-hots are
-        # already 0/1 and stay un-normalized. Active at train AND rollout, so it
-        # is reconstructed from `config["feature_norm"]` by agent_loader.
-        self.feature_norm = th.nn.LayerNorm(feature_dim) if feature_norm else None
-        # Post-cache fix B: modality dropout on the image sub-block. With prob
-        # `image_dropout`, zero image_pool for a sample so the head must predict
-        # from text_pool — breaking the "read the task off the image" shortcut
-        # that otherwise leaves the language channel unused. Train-time only
-        # (gated by self.training); a no-op at rollout, so it needs no loader
-        # plumbing. image_feature_dim defaults to the first half (the split-pooled
-        # [image || text] layout); pass explicitly if that assumption breaks.
-        self.image_dropout = float(image_dropout)
+        self.film = film
+        # Split point of the cached [image_pool || text_pool] feature. Defaults to
+        # the first half (LLaVA split-pool: 4096 image + 4096 text = 8192).
         self.image_feature_dim = (
             image_feature_dim if image_feature_dim is not None else feature_dim // 2
         )
+        self.text_feature_dim = feature_dim - self.image_feature_dim
+        # Post-cache fix B: modality dropout on the image sub-block. With prob
+        # `image_dropout`, zero image_pool for a sample so the head must predict
+        # from text — breaking the "read the task off the image" shortcut. Train-
+        # time only (gated by self.training); a no-op at rollout. In FiLM mode it
+        # is what forces `beta(text)` to carry the task signal (see below).
+        self.image_dropout = float(image_dropout)
+
+        if self.film:
+            # Post-cache fix C: FiLM conditioning. text_pool generates a per-channel
+            # scale (gamma) and shift (beta) that modulate image_pool:
+            #     modulated = (1 + gamma(text)) * image + beta(text)
+            # and the MLP consumes ONLY the modulated image. Unlike concat (which
+            # the head can zero-weight to ignore text), text is structurally injected
+            # into the image representation. Synergistic with image_dropout: when the
+            # image is dropped, modulated collapses to beta(text), forcing beta to
+            # carry the full task signal — and beta is added at rollout too, so the
+            # prompt shifts behavior. Identity init (gen weight=bias=0 -> gamma=1,
+            # beta=0) starts the head as an image-only MLP for stability, then learns.
+            self.feature_norm = None
+            if feature_norm:
+                # Per-modality LayerNorm: equalize image/text scale before FiLM
+                # (stable gamma/beta from text; clean image to modulate).
+                self.film_ln_image = th.nn.LayerNorm(self.image_feature_dim)
+                self.film_ln_text = th.nn.LayerNorm(self.text_feature_dim)
+            else:
+                self.film_ln_image = self.film_ln_text = None
+            self.film_gen = th.nn.Linear(
+                self.text_feature_dim, 2 * self.image_feature_dim
+            )
+            th.nn.init.zeros_(self.film_gen.weight)
+            th.nn.init.zeros_(self.film_gen.bias)
+            head_in = self.image_feature_dim + past_action_dim
+        else:
+            # Post-cache fix A: LayerNorm the whole frozen feature before the probe.
+            # LLaVA's 8192-d mean-pooled features arrive on very different per-dim
+            # scales (image_pool is a mean over ~576 tokens, text_pool over a few),
+            # so an un-normalized first Linear is dominated by the high-variance image
+            # dims and effectively ignores text. A LayerNorm with learnable affine
+            # puts the halves on equal footing. Active at train AND rollout, so it is
+            # reconstructed from `config["feature_norm"]` by agent_loader.
+            self.feature_norm = th.nn.LayerNorm(feature_dim) if feature_norm else None
+            head_in = feature_dim + past_action_dim
+
         self.action_head = th.nn.Sequential(
-            th.nn.Linear(feature_dim + past_action_dim, self.hidden_dim),
+            th.nn.Linear(head_in, self.hidden_dim),
             th.nn.ReLU(),
             th.nn.Linear(self.hidden_dim, output_dim * chunk_size),
         )
@@ -570,22 +600,42 @@ class HeadOnlyAgent(th.nn.Module):
             # (clamped > 1e-3 at use site) so the optimizer can move it freely.
             self.bce_temperature = th.nn.Parameter(th.ones(NUM_BINARY))
 
+    def _drop_image(self, img: th.Tensor) -> th.Tensor:
+        """Whole-modality Bernoulli dropout: zero the image block for a random
+        subset of the batch (train only, no 1/(1-p) rescale). Out-of-place so
+        autograd is happy after a (non-leaf) LayerNorm."""
+        if not (self.training and self.image_dropout > 0.0):
+            return img
+        keep = (
+            th.rand(img.size(0), 1, device=img.device, dtype=img.dtype)
+            >= self.image_dropout
+        ).to(img.dtype)
+        return img * keep
+
     def forward(self, features: th.Tensor, past_actions: th.Tensor | None = None) -> th.Tensor:
-        x = features
-        if self.feature_norm is not None:
-            x = self.feature_norm(x)
-        if self.training and self.image_dropout > 0.0 and self.image_feature_dim > 0:
-            # Structured (whole-modality) Bernoulli dropout: zero the entire
-            # image sub-block for a random subset of the batch — no 1/(1-p)
-            # rescale (mirrors apply_past_action_slot_dropout). Out-of-place mask
-            # multiply keeps autograd happy after the (non-leaf) LayerNorm.
-            keep = (
-                th.rand(x.size(0), 1, device=x.device, dtype=x.dtype)
-                >= self.image_dropout
-            ).to(x.dtype)
-            mask = th.ones_like(x)
-            mask[:, : self.image_feature_dim] = keep
-            x = x * mask
+        if self.film:
+            img = features[:, : self.image_feature_dim]
+            txt = features[:, self.image_feature_dim :]
+            if self.film_ln_image is not None:
+                img = self.film_ln_image(img)
+                txt = self.film_ln_text(txt)
+            img = self._drop_image(img)
+            gb = self.film_gen(txt)
+            gamma = gb[:, : self.image_feature_dim]
+            beta = gb[:, self.image_feature_dim :]
+            x = (1.0 + gamma) * img + beta  # when img dropped -> x = beta(text)
+        else:
+            x = features
+            if self.feature_norm is not None:
+                x = self.feature_norm(x)
+            if self.training and self.image_dropout > 0.0 and self.image_feature_dim > 0:
+                keep = (
+                    th.rand(x.size(0), 1, device=x.device, dtype=x.dtype)
+                    >= self.image_dropout
+                ).to(x.dtype)
+                mask = th.ones_like(x)
+                mask[:, : self.image_feature_dim] = keep
+                x = x * mask
         if self.past_action_dim > 0:
             if past_actions is None:
                 raise ValueError("past_actions required when past_action_dim > 0")
