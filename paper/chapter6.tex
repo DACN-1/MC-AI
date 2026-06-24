@@ -1,0 +1,75 @@
+\chapter{Conclusion and Future Work}
+\label{chap:conclusion}
+
+This thesis asked whether a frozen, general-purpose vision-language model can be
+turned into a controllable Minecraft agent cheaply --- by training only a small
+action head with behavioural cloning, holding the backbone fixed and keeping the
+whole ablation inexpensive enough to sweep on a single rented GPU. Using a
+$2\times2$ ablation over backbone (LLaVA-1.5 versus CLIP) and language condition,
+evaluated in live MineRL rollouts, it reached a clear and slightly surprising
+answer: in this cheap, frozen regime the contrastive backbone is the more
+effective and the more language-steerable choice \emph{under a minimal head} --- a
+richer (FiLM) read-out narrows the task gap from the same LLaVA features, so the
+backbone finding is best read as a head-readout-by-backbone interaction rather
+than an intrinsic ranking of the two models.
+
+Table~\ref{tab:contributions} maps each research question of
+Chapter~\ref{chap:intro} to the evidence that settles it.
+
+\begin{table}[ht]
+\centering
+\begin{tabular}{p{0.11\textwidth}p{0.38\textwidth}p{0.40\textwidth}}
+\hline
+ & Question & Finding \\
+\hline
+RQ1 \newline (backbone) & Used only as a frozen extractor, does a joint VLM beat
+a contrastive one? & \textbf{No}, in this regime. CLIP collects $4.3$ dirt per
+episode where the matched LLaVA cell is at the floor ($0.0$); the gap is a
+read-out effect, since a FiLM head recovers CLIP-level collection from the same
+LLaVA features (Sections~\ref{sec:exp-task}, \ref{sec:exp-film}). \\
+RQ2 \newline (language) & Does the prompt change behaviour, and does it depend on
+the backbone? & \textbf{Yes}, and it depends entirely on the backbone. Only
+CLIP + lang shifts (\texttt{attack} $-48$~pp, $h=-1.04$); both LLaVA cells and the
+CLIP control are flat (Section~\ref{sec:exp-cond}). \\
+RQ3 \newline (evaluation) & Do rollouts reveal what frame metrics miss? &
+\textbf{Yes}, decisively. The four cells are a near-tie on held-out frames yet
+diverge from $4.3$ to $0$ dirt in rollout (Section~\ref{sec:exp-offline}). \\
+\hline
+\end{tabular}
+\caption{The three research questions and the evidence that settles each.}
+\label{tab:contributions}
+\end{table}
+
+Two interpretive points carry beyond the table. First, the LLaVA result is a
+statement about the cheap-and-frozen regime, not about the backbone's ceiling: its
+pooled text representation in fact encodes the prompt almost perfectly (a linear
+probe recovers it at $99.7\%$), but in a form entangled with the image that no
+head-side lever --- including a feature-gating FiLM head --- converts into
+conditioning, so the bottleneck is the pooled representation and the fix is
+upstream of the head (Chapter~\ref{chap:discussion}). Its visual features,
+meanwhile, are usable for the task itself once the head reads them through
+modulation rather than concatenation. Second, the conditioning result is a
+behaviour-routing effect shown on two short-horizon tasks with the prompt doubling
+as task identity; it should not be over-read as compositional
+instruction-following, and absolute dirt counts mix goal-directed digging with
+incidental terrain-attacking (Section~\ref{sec:exp-task}). Within those bounds the
+central claim is firm: under a fixed, inexpensive training budget, a frozen
+contrastive encoder with a five-million-parameter head is both a more effective
+short-horizon Minecraft controller and a more language-steerable one than a frozen
+seven-billion-parameter joint model \emph{read through the same minimal head}. The
+task half of that gap is a head-readout effect --- a FiLM head recovers it from the
+LLaVA features --- so the claim is about the cheap regime and its default
+read-out, not about the backbones' intrinsic limits.
+
+\paragraph{Outlook.} Chapter~\ref{chap:discussion} develops three directions in
+detail. The first relaxes the freezing constraint on the joint backbone exactly
+where this study located the bottleneck --- the entangled text representation ---
+through parameter-efficient fine-tuning or a few learnable conditioning tokens,
+paired with a direct representational probe to confirm whether the text features
+then separate by task. The second takes the CLIP result at face value and composes
+several cheap, prompt-conditioned heads into an LLM-directed hierarchy, keeping
+each controller small while a planner supplies the long-horizon reasoning. The
+third closes the loop with reward: the chop rollouts show a cloned CLIP agent that
+already targets trees but cannot finish the block, an ideal starting point for an
+online, reward-based refinement stage. The cheap-and-frozen recipe characterised
+here is a natural seed for all three.

@@ -1,0 +1,265 @@
+% ======================================================================
+% Chapter 2 -- Background
+% Target: ~5 pages, <=25% of total. British spelling, present tense,
+% active voice, "we"/"one". Every heading opens with a lead-in.
+% [VERIFY] = key not yet confirmed in .bib.
+% ======================================================================
+
+\chapter{Background}
+\label{chap:background}
+
+% TODO: opening motivation paragraph (vision-LANGUAGE model not LLM;
+%       "state cues"; BC is the algorithm) + chapter lead-in naming the
+%       five threads. (Thesis-wide outline goes in the Introduction.)
+
+
+% ----------------------------------------------------------------------
+\section{Imitation Learning and Behavioural Cloning}
+\label{sec:bg-il}
+In the absence of a reward signal, an agent can still induce a policy from
+expert demonstrations through a supervised learning algorithm, a setting
+known as behavioural cloning \cite{Bain1995AFF}. The policy is trained to
+reproduce the expert's action at each observed state. A well-documented
+weakness of this approach is a compounding-error phenomenon: once the agent
+commits an early mistake at deployment, it reaches states the expert
+demonstrations never covered, where its predictions degrade further and
+errors accumulate over the episode \cite{ross2011}. Formally, if the learned
+policy incurs an error probability $\varepsilon$ on states drawn from the
+expert distribution, the expected cost of behavioural cloning grows as
+$\mathcal{O}(\varepsilon T^2)$ over a horizon of $T$ steps, since each
+mistake compounds the mismatch between the states the agent visits and those
+the expert demonstrated \cite{ross2011}. This offline-to-online gap is
+observed empirically in Minecraft behavioural cloning \cite{kanervisto2020},
+and it motivates evaluating the policy through in-environment rollouts
+(Section~\ref{sec:rollout}) rather than held-out-frame metrics alone.
+
+This vulnerability is sharper still when the policy conditions on a single
+observation: with no temporal context, the agent cannot tell where in a
+motion it is, so a momentary perceptual ambiguity can divert it into the
+out-of-distribution regime described above. R1V-A operates in exactly this
+single-frame regime, which motivates the past-action conditioning and
+action-chunking mechanisms introduced in Chapter~\ref{chap:method}.
+
+More recent analysis qualifies how fundamental this gap is. The quadratic
+error growth is not intrinsic to behavioural cloning but depends on the
+training loss: under a logarithmic loss the dependence on the horizon can be
+substantially milder \cite{foster2024horizon}, although this guarantee
+weakens again for the continuous action components that policies such as
+R1V-A must predict \cite{simchowitz2025pitfalls}. The compounding-error view
+therefore remains the appropriate framing here.
+
+
+% ----------------------------------------------------------------------
+\section{Minecraft as a Learning Environment}
+\label{sec:bg-minecraft}
+Minecraft has emerged as a demanding control benchmark for embodied agents,
+owing to its open-ended environment, partial observability, long task
+horizons, and large diversity of objectives \cite{fan2022minedojo}. Early
+agents achieved competent play through symbolic or scripted interfaces that
+abstract away perception and low-level control. A more recent line instead
+requires the agent to act from raw pixels through the same
+keyboard-and-mouse interface a human uses, a substantially harder setting
+that VPT established at scale by behavioural cloning on large quantities of
+human gameplay video \cite{baker2022vpt}. R1V-A belongs to this
+pixel-and-keypress tradition.
+
+Acting through this interface requires a policy to control the same inputs a
+human does: a set of binary key presses together with continuous mouse
+movement. VPT formalises this as a factored action space of discrete key
+toggles plus a two-axis camera signal, and discretises each camera axis into
+mu-law-spaced bins so that the long-tailed distribution of human mouse
+movements is represented at higher resolution near zero \cite{baker2022vpt}.
+R1V-A adopts this action space and bin convention directly
+(Section~\ref{action_space}). Human demonstrations for this setting are
+commonly logged in the BASALT contractor format, in which each frame is
+paired with the action the player executed, with camera magnitudes already
+snapped to the VPT bin centres \cite{shah2021basalt}. The recordings used in
+this work follow this convention, so the action logs map onto the policy's
+output representation without loss.
+% TODO: lifshitz2023steve1 is uncited -- place it (language-for-task-spec
+%       example) or drop it from the chapter.
+
+
+% ----------------------------------------------------------------------
+\section{Vision-Language Models and the Frozen-Backbone Paradigm}
+\label{sec:bg-vlm}
+R1V-A treats a pretrained vision-language model as a fixed feature extractor
+and trains only a small head on its representations. This section introduces
+the two families of vision-language model the experiments compare, which
+differ in how they combine image and text, and then sets out why freezing
+such a model is a sound choice.
+
+\subsection{Contrastive and Joint Vision-Language Models}
+\label{subsec:bg-vlm-families}
+Since we wish to compare the contribution of language to an agent's
+capabilities, we examine two structurally different ways of relating images
+and text. The two backbones we ablate, CLIP and LLaVA, sit at opposite ends
+of a fusion spectrum, and the distinction governs how, and whether, a task
+prompt can influence the visual representation.
+
+CLIP \cite{radford2021clip} couples two independent encoders. A text encoder
+maps a caption to a single embedding, taken from the activations at the
+end-of-sequence position, and a vision encoder (a ViT) maps an image to a
+single embedding via its pooled representation. Both are projected into a
+shared space. Training is contrastive: for a batch of $N$ image-text pairs,
+one forms the $N \times N$ matrix of cosine similarities between every text
+and every image embedding, then maximises the $N$ diagonal entries, the true
+pairs, against the off-diagonal mismatches. The two modalities therefore
+never interact within an example; alignment emerges only through comparison
+across the batch, and fusion amounts to a single dot product in the shared
+space. A consequence we rely on later is that CLIP's image embedding is a
+fixed, language-aligned summary of the frame, computed without reference to
+any prompt.
+
+LLaVA \cite{liu2023llava} instead injects vision into a language model. It
+reuses a CLIP vision encoder to produce a sequence of patch features,
+projects them into the word-embedding space of the language model, and
+concatenates these visual tokens with the embedded prompt tokens. The
+combined sequence passes through the language model, whose self-attention
+layers process the image and text tokens as one sequence, so the two
+modalities are jointly contextualised at every layer rather than only at the
+output. Fusion here is deep rather than late. The follow-up LLaVA-1.5
+\cite{liu2024improvedbaselinesvisualinstruction} keeps this design and
+strengthens it, replacing the original single linear projection with a
+two-layer multilayer perceptron and broadening the instruction-tuning data
+with academic visual-question-answering tasks; this is the backbone R1V-A
+uses. This difference in fusion motivates our ablation. In CLIP the prompt
+enters only as a parallel embedding, whereas in LLaVA it shares a sequence
+with the image inside the model, so the question of whether the prompt
+carries usable signal is distinct for the two backbones.
+
+\subsection{Freezing Strong Pretrained Features}
+\label{subsec:bg-freeze}
+Adapting a large pretrained model to a new task need not mean updating its
+weights. Full fine-tuning, the standard approach, carries a documented risk:
+when the pretraining and downstream distributions differ, updating all
+parameters can distort the pretrained features and degrade performance on
+inputs that fall outside the fine-tuning data, the very generalisation a
+large backbone is meant to provide
+\cite{kumar2022finetuningdistortpretrainedfeatures}. Since R1V-A is evaluated
+in rollout worlds it never saw during training, preserving that
+out-of-distribution generalisation is a direct concern.
+
+Freezing the backbone and training only a lightweight module on top avoids
+this risk and has an established precedent in vision-language modelling.
+BLIP-2 connects a frozen image encoder to a frozen language model through a
+small trainable bridge, reaching competitive performance while leaving both
+large components untouched
+\cite{li2023blip2bootstrappinglanguageimagepretraining}. The same principle
+underlies R1V-A: the vision-language backbone is held fixed and only the
+action head receives gradients.
+
+Freezing is the strict end of a spectrum of parameter-efficient adaptation.
+Methods such as LoRA occupy the middle, injecting a small number of trainable
+low-rank updates into an otherwise frozen backbone, which adapts the model at
+a fraction of the cost of full fine-tuning \cite{hu2022lora}. R1V-A takes the
+most conservative position on this spectrum, leaving every backbone parameter
+unchanged, which both eliminates the distortion risk entirely and makes the
+cached-feature training scheme of Chapter~\ref{chap:method} possible.
+
+
+% ----------------------------------------------------------------------
+\section{Vision-Language-Action Models}
+\label{sec:bg-vla}
+The frozen backbone and trainable action head together form a
+vision-language-action (VLA) model: a system that maps visual and
+linguistic input to control output. R1V-A descends from a recent line of
+such models, and this section places it within that lineage and against its
+closest Minecraft relatives.
+
+The VLA pattern emerged first in robotics, where a vision-language backbone
+is repurposed to emit actions rather than text. RT-2 established the
+template by training a large vision-language model to output robot commands
+as if they were language tokens, transferring web-scale visual and semantic
+knowledge into control \cite{brohan2023rt2}. OpenVLA showed the approach
+scales as an open recipe at the seven-billion-parameter range comparable to
+R1V-A's backbone, adapting the model with low-rank updates rather than full
+retraining \cite{kim2024openvla}. Closer to R1V-A's design, RoboFlamingo
+keeps the vision-language backbone largely fixed and trains a separate
+policy head on top \cite{li2023roboflamingo}, and LLaRA builds a VLA
+directly on a LLaVA-style backbone \cite{li2024llara}, while $\pi_0$
+attaches a lightweight action module to a frozen model \cite{black2024pi0}.
+R1V-A shares this frozen-backbone, separate-head philosophy, but applies it
+to Minecraft rather than physical manipulation.
+
+Within Minecraft, two systems frame the design space this thesis works in. PR2L
+is the closest published precedent and the methodological template for this
+work: it pairs a frozen vision-language model with a learned policy to act from
+pixels \cite{chen2024pr2l}, and as in PR2L the contribution here is comparative
+and diagnostic --- which frozen backbone yields a usable signal, and how that
+signal behaves in closed-loop rollouts --- rather than a new architecture.
+JARVIS-VLA sits at the opposite end of the same axis: it fully post-trains the
+vision-language backbone on Minecraft data \cite{li2025jarvisvla}, whereas R1V-A
+leaves the backbone entirely frozen. It is a conceptual contrast rather than a
+benchmarked baseline --- this thesis reproduces no JARVIS-VLA result and does not
+measure the full post-training-versus-frozen trade-off that a true head-to-head
+would require, confining its conclusions to the frozen regime it actually
+studies.
+
+\subsection{Does the Language Pathway Help?}
+\label{subsec:bg-language}
+A VLA receives a language prompt alongside its visual input, but it does not
+follow that the prompt changes what the agent does. Prior work on
+language-conditioned imitation finds that a natural-language goal can improve
+a policy when tasks must be distinguished, yet image-only policies often
+remain strong baselines, since much of the task is already legible from the
+visual state alone \cite{lynch2021langlfp}. For R1V-A the question is
+sharpened by the frozen-backbone setting: the prompt can only help if the
+fixed backbone already encodes it in a form the action head can read.
+Whether it does so is what the prompt ablation in Chapter~\ref{chap:method}
+measures.
+
+\subsection{Action Chunking}
+\label{subsec:bg-chunking}
+The compounding-error problem of Section~\ref{sec:bg-il} grows with the
+number of independent decisions an agent makes over an episode. Action
+chunking attacks this directly: instead of predicting one action per step,
+the policy predicts a short sequence of future actions in a single forward
+pass, executes the first, and re-plans on the next observation. Introduced by
+ACT for fine-grained imitation, this shortens the effective decision horizon
+and lets the policy commit to locally coherent motions rather than
+re-deciding from scratch at every frame \cite{zhao2023act}. R1V-A adopts the
+predict-a-chunk, execute-the-first recipe, which is a particularly natural
+fit for its single-frame setting, where consecutive observations carry
+little new information and short bursts of action are highly predictable.
+
+
+% ----------------------------------------------------------------------
+\section{Factored Action Spaces and Multi-Label Prediction}
+\label{sec:bg-action}
+A policy that controls a keyboard faces a combinatorial output space: with
+$k$ keys, the set of possible key combinations is $2^k$, far too large to
+treat as a single categorical choice. The standard remedy is to factor the
+action space, predicting each component independently rather than enumerating
+their joint configurations.
+
+Action branching applies this idea by giving each discrete action dimension
+its own output head, so the number of predictions grows linearly in the
+number of keys rather than exponentially \cite{tavakoli2018actionbranching}.
+R1V-A predicts each key as an independent binary decision, which also matches
+the structure of the data: a human routinely holds several keys at once, for
+example moving forward while attacking, so the targets are genuinely
+multi-label rather than mutually exclusive. The head is therefore trained
+with a binary cross-entropy loss applied per key, the natural objective for
+independent binary outputs.
+
+The two continuous camera axes are handled separately. Following the VPT
+convention, each axis is discretised into mu-law-spaced bins and predicted as
+a categorical distribution, so that camera control becomes a classification
+problem alongside the keys rather than a regression
+\cite{baker2022vpt}. This keeps the entire action head within a single
+classification framework and lets the mu-law spacing devote finer resolution
+to the small movements that dominate human play.
+
+
+% ----------------------------------------------------------------------
+% OPEN ITEMS (still to do):
+%  - Write the chapter opening paragraph + chapter lead-in (top of file).
+%  - Place or drop lifshitz2023steve1 (2.2).
+%  - Add zhao2023act to .bib.
+%  - Resolve all [VERIFY] keys against the .bib.
+%  - MineDreamer provenance -> Method Dataset section (not here).
+%  - Check VLA acronym is not also expanded in the Introduction.
+%  - OPTIONAL: justify plain BCE vs reweighted losses (focal/asymmetric)
+%    in 2.5 only if you want to cite ridnik2021asymmetric / lin2017focal.
+% ----------------------------------------------------------------------

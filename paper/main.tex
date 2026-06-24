@@ -1,0 +1,121 @@
+% Mit twoside als weitere Option werden die Seitenränder angepasst, sodass beidseitig gedruckt werden kann
+\documentclass[pdftex,12pt,a4paper]{report}
+
+% kann optional mit "german" als Sprache gewählt werden
+\usepackage[]{dbstmpl}
+
+
+
+\global\arbeit{Bachelor Thesis}
+%\global\arbeit{Masterarbeit}
+%\global\arbeit{Seminararbeit}
+
+
+
+
+% Hier die eigenen Daten eintragen
+\global\titel{Action-Head Learning on Frozen Vision-Language Models for an Autonomous Minecraft Agent}
+\global\bearbeiter{Diego Cuenca}
+\global\betreuer{Prof. Volker Tresp}
+\global\aufgabensteller{AUFGABENSTELLERNAME}
+\global\abgabetermin{30.06.2026}
+\global\ort{Munich}
+\global\fach{Computer Science}
+
+\begin{document}
+
+% Deckblatt
+\deckblatt
+
+% Erklaerung fuer das Pruefungsamt
+% Bei Seminararbeiten nicht noetig
+\erklaerung
+
+% Zusammenfassung
+\begin{abstract}
+Vision-language models carry broad visual and semantic priors, which makes them
+attractive backbones for embodied agents --- but turning one into an agent
+usually means post-training the whole model on action data, tying it to a single
+embodiment at substantial cost. This thesis asks how far the cheap alternative
+goes: freeze the backbone, train only a small ($\sim$5M-parameter) action head by
+behavioural cloning, and keep the whole study inexpensive enough to sweep on a
+single rented GPU. Using Minecraft as a deliberately hard test bed, it runs a
+$2\times2$ ablation over backbone (the joint LLaVA-1.5 versus the contrastive
+CLIP) and language condition (task prompt versus none), evaluating every cell
+both on held-out frames and in live MineRL rollouts.
+
+Three findings emerge. First, under the minimal concatenating head that the
+controlled comparison holds fixed, the contrastive backbone is the more effective
+controller --- CLIP collects dirt where the matched LLaVA cell sits at the floor
+--- but this is a property of the head read-out, not of the backbone: a FiLM head
+recovers CLIP-comparable collection from the same frozen LLaVA features, making
+the result a head-by-backbone interaction rather than an intrinsic ranking.
+Second, language conditioning is likewise a backbone effect --- only CLIP's
+separate text encoder yields a prompt signal the head can act on (a $48$-point
+attack-rate shift), while LLaVA stays flat across prompts even though the prompt
+is almost perfectly decodable from its features. Third, and most robustly, these
+differences are invisible offline: the four cells are a near-tie on frame metrics
+yet diverge from $4.3$ to $0$ dirt per episode in rollout --- a direct
+demonstration that closed-loop evaluation measures what frame-level metrics miss.
+The study characterises the cheap-and-frozen corner of the design space and does
+not claim either backbone's ceiling under fine-tuning.
+\end{abstract}
+
+% Inhaltsverzeichnis (abhaengig von der Laenge des Dokuments)
+\tableofcontents
+
+% Hier beginnt der Hauptteil
+
+\input{chapter1}
+\input{chapter2}
+\input{chapter3}
+\input{chapter4}
+\input{chapter5}
+\input{chapter6}
+
+
+
+
+
+
+
+\newread\tmp
+
+\newcommand{\quickcharcount}[1]{%
+  \immediate\write18{texcount -1 -sum -merge -char #1.tex > #1-chars.sum}%
+  \openin\tmp=#1-chars.sum%
+  \read\tmp to \thechar%
+  \closein\tmp%
+}
+
+\newcommand{\quickwordcount}[1]{%
+  \immediate\write18{texcount -1 -sum -merge #1.tex > #1-words.sum}%
+  \openin\tmp=#1-words.sum%
+  \read\tmp to \theword%
+  \closein\tmp%
+}
+
+
+\quickwordcount{main}
+\quickcharcount{main}
+
+There are \thechar characters and approximately \theword spaces.
+That makes approximately \the\numexpr\theword+\thechar\relax\ characters total.
+
+
+%% Ende Hauptteil
+
+% Abbildungsverzeichnis (kann auch nach dem Inhaltsverzeichnis kommen)
+%\listoffigures
+
+% Tabellenverzeichnis (kann auch nach dem Inhaltsverzeichnis kommen)
+%\listoftables
+
+% Literaturverzeichnis
+\bibliographystyle{plain}
+\bibliography{dbstmpl}
+
+
+% verwendet dbstmpl.bib
+
+\end{document}

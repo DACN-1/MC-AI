@@ -1,0 +1,245 @@
+\chapter{Discussion}
+\label{chap:discussion}
+
+The objective of this thesis was to find an effective yet cheap recipe for
+turning a pretrained vision-language model into an acting agent, using Minecraft
+as a deliberately hard test bed. The recipe was held to two constraints: the
+backbone stays frozen, and training stays inexpensive enough to sweep the full
+ablation on a single rented GPU (Section~\ref{caching}). This chapter reads the
+results of Chapter~\ref{chap:experiments} against that objective, asks why the
+two backbones behave so differently, examines what the agents do and do not
+achieve in the chop environment, states the limits of the study, and lays out
+two directions the findings open up.
+
+\section{CLIP and LLaVA Head-to-Head Under a Cheap, Frozen Regime}
+\label{sec:disc-headtohead}
+
+The clearest message of the ablation is that, under the constraints this thesis
+imposes, the simpler backbone wins --- with the important qualification,
+developed below, that this is a property of the minimal head, not an intrinsic
+ranking of the two backbones. Of the two frozen extractors, the
+contrastive CLIP encoder both conditions on the prompt
+(Section~\ref{sec:exp-cond}) and collects the discriminating item
+(Section~\ref{sec:exp-task}), whereas the joint LLaVA-1.5 backbone does neither
+in its matched, knob-free configuration. On the task that separates the cells,
+dirt collection, CLIP digs in every episode with the prompt and in eight of ten
+without it, while both LLaVA anchor cells sit at the floor; on conditioning, CLIP
+with language shifts its \texttt{attack} rate by $48$ percentage points between
+the empty and on-task prompts, an effect an order of magnitude larger than
+anything either LLaVA cell produces. For a practitioner who wants a controllable
+short-horizon agent on a small budget, the result is encouraging: the cheaper
+$0.43$B contrastive encoder, paired with a $4.6$M-parameter head, is the more
+effective choice here \emph{under this minimal head}, not the $7$B autoregressive
+one. Set against the contractor it imitates, though, even the best agent is modest
+in absolute terms: measured from the recordings, the demonstrator collects $18.3$
+dirt per thousand steps, so CLIP\,+\,lang's $4.3$ is about a quarter of the expert
+rate --- far above the random floor of zero, but a reminder that the comparison
+this study makes cleanly is between cells, not against mastery.
+
+This separation is invisible to held-out frame accuracy. On the test frames the
+four cells are near-identical --- movement-$F_1$ spans only $0.368$ to $0.431$ and
+even ranks CLIP $-$ lang first --- yet they diverge from $4.3$ to $0$ dirt in
+rollout (Section~\ref{sec:exp-offline}). The head-to-head verdict is therefore a
+property of closed-loop behaviour, not of frame-level fit, and it would be missed
+entirely by the offline metrics that imitation-learning studies usually report.
+This is itself the answer to the third research question, and a caution against
+selecting backbones on frame accuracy alone.
+
+This conclusion must be stated at the right altitude, and the FiLM probe of
+Section~\ref{sec:exp-film} fixes that altitude. The probe shows that the same
+frozen LLaVA features that produced a hard zero can be made to collect dirt at
+CLIP-comparable levels once the head reads them through feature-wise modulation
+rather than plain concatenation. The honest claim is therefore not that LLaVA's
+representation is intrinsically weaker for control, but that \emph{under the
+simplest head---the one the controlled $2\times2$ holds fixed---CLIP extracts
+more usable task signal per unit of engineering effort}. The advantage CLIP
+shows is an advantage of the cheap regime, which is precisely the regime this
+thesis set out to characterise. A contrastive encoder aligns image and text in a
+single shared embedding by construction, so a linear head can read a
+prompt-dependent direction out of it directly; the joint decoder hides the same
+information behind a pooling and read-out step that the minimal head cannot
+invert.
+
+\section{Why the LLaVA Language Pathway Stays Silent}
+\label{sec:disc-washout}
+
+The most striking negative result is that LLaVA's behaviour is statistically
+indistinguishable across all four prompt conditions: the explicit task string
+moves the policy no more than the zeroed control does. The tempting reading ---
+that the language tokens are drowned out by the roughly $576$ image tokens --- is
+too crude. The \texttt{<image>} placeholder is expanded into those visual tokens
+\emph{alongside} the prompt tokens, the split-pooling of Section~\ref{sec:backbone}
+keeps the text-role tokens as an explicit half of the feature, and the linear
+probe of Section~\ref{sec:exp-probe} shows the prompt is in fact almost perfectly
+recoverable from that half ($99.7\%$, collapsing to chance when it is zeroed). The
+prompt is not washed out in the crude sense.
+
+Recoverable, however, is not the same as usable, and the rest of the evidence
+shows the limit is the representation, not the head. In the combined training set
+the two prompts are perfectly correlated with two biomes, and the pooled LLaVA
+text half is image-entangled --- its tokens attend to the frame inside the decoder
+--- so the $99.7\%$ is largely a prompt--image confound rather than a clean prompt
+axis. The FiLM probe is the decisive check: a head that multiplicatively gates the
+features on that very text vector, strictly more expressive than the concatenating
+baseline, still does not condition (Section~\ref{sec:exp-film}). If a usable prompt
+axis were present, a gating head would exploit it; that it cannot indicates there
+is none to exploit, and head capacity is therefore not the limiting factor. The
+contrast with CLIP isolates what is: CLIP's text encoder is physically separate
+from its image encoder, so its prompt embedding is an image-independent axis that
+moves when, and only when, the prompt changes, and the head learns to ride it.
+LLaVA's final-layer text positions, mean-pooled, fold the prompt and the frame
+together, so changing only the prompt at a fixed scene barely moves the
+representation. The bottleneck is thus upstream of the head, and the remedies that
+follow are representational rather than architectural on the head side: pooling the
+prompt from a position that is not image-saturated --- the final text token rather
+than the mean --- or lightly fine-tuning the backbone so the text pathway carries a
+separable signal. A counterfactual probe that swaps the prompt at a fixed frame
+would measure the confound directly, and is the cleanest next test
+(Section~\ref{sec:disc-future}).
+
+\section{Targeting Without Completion in the Chop Environment}
+\label{sec:disc-chop}
+
+Reward and item counts tell only part of the story for the chop task, where every
+cell is at the floor (Section~\ref{sec:exp-task}). Inspecting the rollout videos
+rather than the scalar logs reveals that the better CLIP agents are not failing
+at random: they orient toward nearby trees, walk up to a trunk, and fire
+\texttt{attack} into it --- the coarse structure of chopping is present. What they
+miss is the fine control that finishes the job: holding the camera steady on a
+single block long enough, at the right pitch, for the break to complete. The
+agent targets the tree but does not reliably mine the block. This is the
+signature of the compounding-error ceiling that behavioural cloning carries by
+construction (Section~\ref{sec:bg-il}): trained only to imitate single-step
+actions with no reward and no corrective feedback, the policy reproduces the
+gross demonstrated behaviour but drifts on the tight closed-loop control that
+block-breaking demands, and nothing in the offline objective pushes it back onto
+the narrow trajectory that completes the chop. A demo-side analysis locates where
+that trajectory runs out of supervision. Aligning camera motion to the onset of
+sustained \texttt{attack} runs --- the median chop commit lasts about $90$ frames
+--- shows the contractor does move the camera more in the half-second \emph{before}
+committing to a chop than during it ($3.1^\circ$ versus $1.4^\circ$ of per-frame
+motion), so an aiming phase is present in the data. But that motion is largely
+undirected: its net signed pitch is only $-0.45^\circ$ against $1.4^\circ$ of
+magnitude --- a faint downward bias toward the trunk base, swamped by exploratory
+wander --- and yaw carries no consistent direction at all. The precise
+\enquote{aim at the trunk} signal a head would need to finish the block is
+therefore weak in the demonstrations themselves, so part of the chop gap is a
+limit of the supervision, not only of the cloned policy. That the qualitative
+behaviour is already on the right track, while the scalar reward stays at zero, is itself a
+finding: it suggests the gap to task completion here is one of refinement, not of
+gross capability, and that the right lever is a training signal that can reward
+the last few degrees of aim rather than a larger or unfrozen backbone.
+
+The conditioning result of Section~\ref{sec:exp-cond} casts this task in a second,
+initially puzzling light: the on-task \enquote{chop a tree} prompt \emph{suppresses}
+the CLIP\,+\,lang agent's \texttt{attack} key, from $84.9\%$ under the empty prompt
+to $37.0\%$ --- a drop in precisely the action that chopping requires. A natural
+hope is that this merely replays the demonstrations, but the contractor data rules
+that out. Measured directly from the recordings, the chop demonstrator attacks on
+$83.1\%$ of steps and the dirt demonstrator on $94.6\%$; both tasks are
+attack-heavy, and the empty-prompt policy ($84.9\%$) faithfully reproduces that
+baseline. The prompt then drives \texttt{attack} \emph{below} either demonstrator,
+so the suppression cannot be imitation of a low-attack chopping style --- no such
+style exists in the data. It is a genuine prompt-induced reorganisation of
+behaviour rather than a replayed statistic; what it is not is evidence of
+\emph{correct} task behaviour, since neither the high-attack empty-prompt agent nor
+the suppressed prompted one completes a chop. The $48$-point shift thus shows that
+the prompt steers the policy (RQ2) without showing that it steers it toward the
+goal: the chop environment exposes the limit of conditioning as sharply as the
+dirt environment exposes its use, and steering and task-appropriateness remain
+separate properties.
+
+\section{Limitations}
+\label{sec:disc-limits}
+
+Several limits bound how far these conclusions generalise. First, the
+in-environment comparisons rest on ten episodes per cell; although MineRL is
+seed-deterministic, so each run reproduces exactly, those ten episodes are still a
+small sample over ten distinct world seeds. The per-step firing rates that carry
+the conditioning result are estimated from $\sim\!10^4$ observations and are
+robust, but the per-episode task metrics are noisy over that small sample, so the
+within-CLIP prompt-versus-no-prompt difference is only suggestive and the
+cross-backbone task gap is the one task comparison I treat as reliable. This
+sampling caveat has a counterpart on the training side: each cell is a single
+training run at one seed, so the headline effects --- the $-48$-point conditioning
+shift, the symmetric LLaVA flats, the cross-backbone dirt gap --- carry no
+across-training-seed error bars, and head initialisation or data ordering cannot
+be formally excluded as contributors. The per-step effect sizes are large enough
+($|h|>1$ for the conditioning shift) that seed noise is an unlikely explanation,
+but replicating each cell across several training seeds is the most important
+robustness check this study leaves open. The quantitative \emph{task} story, in
+turn, rests on a single working task: chop is at the floor for every cell, so dirt
+collection is the only task on which the agents produce a completion metric at
+all, with the chop environment contributing the per-step conditioning shift and
+the qualitative targeting result but no scalar separation. Second, the study fixes the
+backbone as frozen and the head as a minimal two-layer MLP; it therefore
+characterises the cheap-and-frozen corner of the design space and cannot speak to
+what either backbone achieves under fine-tuning or a richer head, a boundary the
+FiLM probe already shows matters. Third, the policy is single-frame with a short
+past-action window, so it is structurally ill-suited to the long-horizon credit
+assignment that full task completion in Minecraft demands. Fourth, the two tasks
+are short-horizon and the prompt doubles as a task-identity signal on the combined
+dataset (Section~\ref{ablation}), so the conditioning result demonstrates that
+language \emph{routes behaviour by task} for CLIP, not that the model parses
+compositional instructions. Relatedly, the dirt-collection metric is not a pure
+measure of goal pursuit: the no-prompt cells dig comparable amounts in the chop
+and dirt environments (Table~\ref{tab:task}), so an absolute dirt count conflates
+goal-directed digging with incidental ground-attacking, and it is the
+prompt-driven \emph{lift} between environments, not the raw count, that cleanly
+reflects task-following. Finally, the LLaVA no-prompt control is not a perfect
+negative: because the prompt still flows through the decoder and only the pooled
+text vector is zeroed, the LLaVA image features remain prompt-conditioned even in
+the control, which is one more reason the cleanest statement is the
+\emph{symmetric} flatness of LLaVA across all four conditions rather than a single
+prompt-versus-control contrast.
+
+\section{Future Directions}
+\label{sec:disc-future}
+
+The findings push in two complementary directions.
+
+\paragraph{Earn the joint backbone its keep.} The silence of LLaVA's language
+pathway is a property of the frozen, minimal-head regime, not a verdict on joint
+vision-language models, which have driven strong long-horizon Minecraft and
+robotics agents once a heavier pipeline is allowed
+\cite{li2025jarvisvla, kim2024openvla, brohan2023rt2, black2024pi0}. Because the
+bottleneck this study locates is upstream of the head, in the pooled text
+representation (Section~\ref{sec:disc-washout}), the cheapest next step keeps the
+whole two-stage pipeline and changes only how the prompt is pooled: re-caching from
+a position that is not image-saturated --- the final text token rather than the
+mean over text positions --- might expose the prompt as a separable axis at no
+extra training cost. Beyond that, relaxing the freeze with parameter-efficient
+fine-tuning such as LoRA \cite{hu2022lora}, or a few learnable conditioning tokens,
+could let the decoder carry a behaviourally separable prompt signal without the
+feature distortion that full fine-tuning risks
+\cite{kumar2022finetuningdistortpretrainedfeatures, simchowitz2025pitfalls}. The
+cleanest diagnostic that should precede either is a counterfactual probe:
+re-encode a fixed set of frames under each prompt and measure how far the pooled
+text representation moves, quantifying directly how much of the $99.7\%$
+decodability of Section~\ref{sec:exp-probe} is a usable prompt axis rather than the
+prompt--image confound.
+
+\paragraph{Lean into cheap models, and compose them.} The other direction takes
+the CLIP result at face value: a small contrastive backbone with a light head is
+already an effective short-horizon controller, so it is worth pushing how far that
+cheapness scales. Long-horizon competence need not come from a single large model;
+it can come from composing several cheap, prompt-conditioned CLIP heads into a
+multi-skill policy that is directed by a separate language model acting as a
+high-level planner \cite{lifshitz2023steve1, fan2022minedojo, lynch2021langlfp}.
+Such a hierarchy keeps each control policy simple and inexpensive to train while
+letting the planner supply the knowledge-based reasoning that bridges abstract
+goals and low-level actions --- exactly the gap a frozen contrastive encoder
+cannot close on its own.
+
+\paragraph{Close the loop with reward.} Cutting across both directions is the
+chop observation of Section~\ref{sec:disc-chop}: a behaviourally-cloned CLIP agent
+that already targets trees but cannot finish the block is a strong starting point
+for a second, online training stage. Fine-tuning the cloned policy against a
+rollout-based reward, or nudging it with corrective feedback in the
+DAgger family \cite{ross2011}, would supply exactly the closed-loop signal that
+offline cloning lacks, reinforcing the last few degrees of aim that separate
+visible targeting from a completed chop. Because the underlying gross behaviour is
+already present, such a stage plausibly needs far less interaction than learning
+the task from scratch --- a hypothesis that follows directly from the qualitative
+result and that the cheap-and-frozen recipe of this thesis is well positioned to
+seed.

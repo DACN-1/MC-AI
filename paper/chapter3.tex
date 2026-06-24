@@ -1,0 +1,536 @@
+\chapter{Method}
+\label{chap:method}
+\section{Problem Formulation}
+
+I frame the task as imitation learning from recorded gameplay demonstrations
+\cite{Bain1995AFF}. At each timestep $t$, the agent observes an RGB frame
+$s_t$ of resolution $360 \times 640 \times 3$, paired with a natural-language
+task prompt $p$ describing the goal (e.g.\ \enquote{collect dirt}). The agent
+must predict an action $a_t \in \{0,1\}^{21} \times \mathbb{R}^2$, comprising
+21 binary key presses and 2 continuous camera magnitudes $(c_x, c_y)$. The
+training signal is a dataset of demonstrations
+\begin{equation}
+    \mathcal{D} = \{(s_t,\, p,\, a_t)\}_{t=1}^{N},
+\end{equation}
+where each frame is paired with the action the demonstrator executed at that
+timestep. No reward signal is available; the learner can only infer
+$\hat{\pi}$ from the state-action pairs in $\mathcal{D}$. I therefore adopt
+Behavioural Cloning (BC) as my learning algorithm.
+
+The policy does not consume visual history: only the current frame $s_t$ is
+encoded by the backbone. To partially compensate, the head is conditioned on
+a short window of past actions and predicts a short chunk of future actions,
+as described in Sections~\ref{past_action} and~\ref{chunking}.
+
+Finally, I note that the absence of expert querying during training can lead
+to \textit{compounding errors}: once the agent deviates from states seen in
+$\mathcal{D}$, it finds itself in an out-of-distribution region from which it
+cannot recover \cite{ross2011}. This offline-to-online gap is a fundamental
+property of plain BC, where errors scale as $\mathcal{O}(\varepsilon T^2)$
+with horizon $T$, and motivates both the action-chunking design choice in
+Section~\ref{chunking} and the in-environment rollout evaluation in
+Section~\ref{sec:rollout}.
+
+\section{Architecture} \label{sec:architecture}
+
+\subsection{Frozen Vision-Language Backbone} \label{sec:backbone}
+Freezing strong pretrained representations and training only a lightweight
+head has been shown to match or exceed full fine-tuning accuracy while
+remaining computationally
+tractable~\cite{kumar2022finetuningdistortpretrainedfeatures}, a paradigm
+established in vision-language modelling by
+BLIP-2~\cite{li2023blip2bootstrappinglanguageimagepretraining}. I adopt
+LLaVA-1.5-7B~\cite{liu2024improvedbaselinesvisualinstruction}, which pairs a
+CLIP-ViT-L-336px vision encoder with a Vicuna-7B language decoder, as the
+primary frozen backbone. Each state $(s_t, p)$ is passed jointly through
+\texttt{LlavaProcessor} and the autoregressive decoder, where the single
+\texttt{<image>} placeholder is expanded to 576 visual tokens that are
+processed alongside the prompt tokens through all decoder layers. I read the
+post-normalisation hidden states of the final layer via a forward hook on the
+decoder's terminal RMSNorm.
+
+Because the LLaMA decoder exposes no CLS token, a fixed-size summary must be
+pooled from the token sequence. A naive mean over the full joint sequence is
+dominated by the roughly 576 visual tokens and washes out the handful of
+prompt tokens. I therefore pool the image-role and text-role tokens
+\emph{separately} using their attention masks and concatenate the two
+4096-dimensional means:
+\begin{equation}
+    \phi_{\mathrm{LLaVA}}(s_t, p) = \bigl[\, \overline{h}^{(L)}_{\mathcal{I}}\,;\;
+    \overline{h}^{(L)}_{\mathcal{T}} \,\bigr] \in \mathbb{R}^{8192},
+\end{equation}
+where $\overline{h}^{(L)}_{\mathcal{I}}$ and $\overline{h}^{(L)}_{\mathcal{T}}$
+are the masked means of the final-layer hidden states over the image-role
+token set $\mathcal{I}$ and the text-role token set $\mathcal{T}$, each of
+dimension 4096. Split-pooling keeps the language signal as an explicit,
+undiluted component of the representation, mirroring the concatenated layout
+of the contrastive baseline below. All 7B backbone parameters are frozen
+throughout training, so only the action head defined in
+Section~\ref{action_head} receives gradient updates.
+
+\subsection{Contrastive Vision-Language Baseline} \label{sec:clip_baseline}
+To isolate the contribution of LLaVA's joint vision-language reasoning from
+its raw visual features, I include a frozen CLIP-ViT-L/14
+baseline~\cite{radford2021clip} as a comparison backbone. Whereas LLaVA fuses
+image and text inside a single autoregressive decoder, CLIP encodes the two
+modalities with separate encoders that have only been aligned by contrastive
+pretraining. The image encoder produces a 768-dimensional pooled image
+embedding $\phi_v(s_t)$ and the text encoder produces a 768-dimensional
+pooled text embedding $\phi_t(p)$. I concatenate the two to form the joint
+representation
+\begin{equation}
+    \phi_{\mathrm{CLIP}}(s_t, p) = \bigl[\,\phi_v(s_t);\; \phi_t(p)\,\bigr] \in \mathbb{R}^{1536}.
+\end{equation}
+When the prompt is ablated (Section~\ref{ablation}), the text branch is
+replaced with a zero vector of the same dimensionality rather than removed,
+so the head input shape is held constant across language conditions and only
+the backbone choice is varied. Because the CLIP image encoder is separate
+from the text encoder, its visual features never attend to the prompt; this
+is the key respect in which the no-prompt condition differs between the two
+backbones (Section~\ref{ablation}).
+
+\subsection{Action Space} \label{action_space}
+The MineRL environment exposes a hybrid action space inherited from
+VPT~\cite{baker2022vpt}: 21 binary keys (movement, attack, use, hotbar
+selection, inventory toggle, ESC) and 2 continuous camera magnitudes
+$(c_x, c_y) \in \mathbb{R}^2$ controlling view pitch and yaw. Predicting the
+21 binary keys jointly as a single categorical distribution over all $2^{21}$
+combinations is intractable; following the action-branching paradigm of
+Tavakoli et al.~\cite{tavakoli2018actionbranching}, I instead predict each
+key independently via its own sigmoid output, which scales linearly rather
+than combinatorially in the number of keys.
+
+The continuous camera axes are handled separately. Rather than regressing
+$(c_x, c_y)$ directly, I discretise each axis into 11 mu-law-spaced bins
+following the VPT convention~\cite{baker2022vpt}, allowing the policy to
+represent the bimodal \enquote{stay still vs.\ turn} structure of human
+demonstrations that a regression loss would collapse to the mean. Each axis
+is therefore predicted as a categorical distribution over 11 bins, decoded
+back to degrees at rollout time via the mu-law inverse. This yields the
+per-step output dimensionality $D = 21 + 2 \times 11 = 43$.
+
+\subsection{Past-Action Conditioning} \label{past_action}
+A single frame is often insufficient to disambiguate the current action under
+behavioural cloning. Tasks such as \texttt{collect\_dirt} and
+\texttt{chop\_a\_tree} are dominated by long, repetitive action runs:
+attack sequences of roughly 30 ticks while breaking a block, forward runs of
+50 to 200 ticks while traversing the world, and small camera adjustments when
+tracking a stationary target. Within such a run, consecutive frames are
+visually near-identical, yet the correct action is overwhelmingly to repeat
+the previous one. The conditional probability $\Pr(a_t = 1 \mid a_{t-1} = 1)$
+is much higher than the marginal $\Pr(a_t = 1)$ for these sticky actions, but
+single-frame BC only learns the marginal.
+
+I therefore condition the action head on the last $K = 8$ executed actions.
+Each past action is encoded as a $D = 43$ dimensional vector matching the
+per-step output layout: the 21 binary keys as $0/1$ indicators (several of
+which may be active at once) and each of the two camera axes as a one-hot
+over its 11 mu-law bins. The resulting $K \times D$ matrix is flattened and
+concatenated to the pooled backbone feature $\phi(s_t, p)$ before the head.
+The window is zero-padded at trajectory start and right-aligned so the most
+recent action occupies the last slot. This signal is intentionally injected
+at the head input rather than appended to the text prompt. The head receives
+the $K \cdot D = 344$ dimensional past-action vector as a dedicated
+full-strength input to its trainable weights, whereas the same information
+expressed as prompt text would have to be encoded and summarised by the
+frozen backbone, competing with the task prompt inside the pooled text
+representation and reaching the head only as a diluted, fixed-width fragment.
+
+\subsection{Action Chunking} \label{chunking}
+To mitigate compounding error and exploit short-horizon predictability, the
+head predicts a chunk of $N = 8$ future actions per forward pass rather than
+a single next action. Concretely, the head output is reshaped from a flat
+vector of size $N \cdot D$ into an $(N, D)$ tensor, with each row interpreted
+as the logits for one future timestep. During training, the loss averages
+over the chunk axis so every predicted step contributes equally. At rollout
+time the policy executes only the first step of each chunk before re-planning
+on the next frame; the remaining steps serve only as auxiliary supervision
+that encourages the head to internalise short-horizon dynamics.
+
+\subsection{Trainable Action Head} \label{action_head}
+The action head is a two-layer MLP with ReLU activation that maps the
+concatenated input
+\begin{equation}
+    x_t = \bigl[\,\phi(s_t, p);\; \mathrm{vec}(a_{t-K:t-1})\,\bigr]
+    \in \mathbb{R}^{F + K \cdot D},
+\end{equation}
+where $F$ is the backbone feature dimensionality ($F = 8192$ for LLaVA,
+$F = 1536$ for CLIP), to a vector of chunked action logits
+\begin{equation}
+    \pi_\theta(s_t, p, a_{t-K:t-1}) = W_2 \, \mathrm{ReLU}(W_1 \, x_t + b_1) + b_2,
+\end{equation}
+which is reshaped to $\mathbb{R}^{N \times D}$. With $K = 8$ past actions,
+$N = 8$ chunk steps, hidden width $H = 2048$, and per-step dimension
+$D = 43$, the head has $W_1 \in \mathbb{R}^{(F + K D) \times H}$ and
+$W_2 \in \mathbb{R}^{H \times (N D)}$, totalling approximately $18.2$M
+parameters for the LLaVA variant and $4.6$M parameters for the CLIP variant,
+both negligible against the $7$B and $0.43$B frozen backbones respectively.
+% Confirmed against the four reported checkpoints (verification_paper.md,
+% 2026-06-23, configs dumped from model_best.pt): hidden_dim=2048 for all four
+% cells; head W1 shapes (2048, 8536) LLaVA / (2048, 1880) CLIP; head parameter
+% counts exactly 18,188,632 (LLaVA) and 4,557,144 (CLIP). The trained head is the
+% cached HeadOnlyAgent, hidden width held constant across both backbones, not the
+% embed-dim-fixed (768) head in frozen_vision_baseline.py.
+The action head is held in \texttt{fp32}, and pooled backbone
+features are cast to \texttt{fp32} at the head input. During feature
+extraction the frozen LLaVA decoder computes in \texttt{bf16}
+(Section~\ref{caching}); the CLIP baseline runs in its native \texttt{fp32}.
+
+\section{Training Objective}
+
+\subsection{Loss Function} \label{sec:loss}
+The Minecraft action space is fundamentally multi-label: a human player
+routinely combines actions, for example holding \texttt{forward} while
+pressing \texttt{attack} and adjusting the camera. A softmax cross-entropy
+loss would force the policy to commit to a single most-likely action,
+collapsing this combinatorial structure to a one-hot prediction. Following
+the action-branching rationale of Tavakoli et
+al.~\cite{tavakoli2018actionbranching}, I treat the 21 binary keys at each
+chunk step as independent Bernoulli outputs trained with binary
+cross-entropy. Let $z_{t,n} \in \mathbb{R}^D$ denote the predicted logits
+for chunk step $n$ at training timestep $t$, with binary slice
+$z^{\mathrm{bin}}_{t,n} \in \mathbb{R}^{21}$ and target
+$a^{\mathrm{bin}}_{t,n} \in \{0,1\}^{21}$. The binary loss is
+\begin{equation}
+    \mathcal{L}_{\mathrm{bin}}(\theta) = -\frac{1}{N_{\mathrm{tot}} \cdot N \cdot 21}
+    \sum_{t=1}^{N_{\mathrm{tot}}} \sum_{n=1}^{N} \sum_{i=1}^{21}
+    \Bigl[ a^{\mathrm{bin}}_{t,n,i} \log \sigma(z^{\mathrm{bin}}_{t,n,i})
+         + (1 - a^{\mathrm{bin}}_{t,n,i}) \log(1 - \sigma(z^{\mathrm{bin}}_{t,n,i})) \Bigr],
+\end{equation}
+where $N_{\mathrm{tot}}$ is the number of training samples, $N$ is the chunk
+size, and $\sigma$ is the sigmoid function.
+
+The two camera axes are categorical (Section~\ref{action_space}) and trained
+with standard cross-entropy over their 11 mu-law bins. Let
+$\tilde{a}^{(x)}_{t,n}, \tilde{a}^{(y)}_{t,n} \in \{1, \dots, 11\}$ denote
+the target bin indices for camera_x and camera_y at chunk step $n$, and let
+$z^{(x)}_{t,n}, z^{(y)}_{t,n} \in \mathbb{R}^{11}$ denote the corresponding
+logit slices. The camera loss is the average over both axes and all chunk
+steps:
+\begin{equation}
+    \mathcal{L}_{\mathrm{cam}}(\theta) = \frac{1}{2 N_{\mathrm{tot}} N}
+    \sum_{t=1}^{N_{\mathrm{tot}}} \sum_{n=1}^{N}
+    \Bigl[ \mathrm{CE}\bigl(z^{(x)}_{t,n}, \tilde{a}^{(x)}_{t,n}\bigr)
+         + \mathrm{CE}\bigl(z^{(y)}_{t,n}, \tilde{a}^{(y)}_{t,n}\bigr) \Bigr].
+\end{equation}
+
+The full training objective is the unweighted sum:
+\begin{equation}
+    \mathcal{L}(\theta) = \mathcal{L}_{\mathrm{bin}}(\theta) + \mathcal{L}_{\mathrm{cam}}(\theta).
+\end{equation}
+Averaging the two camera cross-entropies internally keeps
+$\mathcal{L}_{\mathrm{cam}}$ on roughly the same scale as
+$\mathcal{L}_{\mathrm{bin}}$ from the start of training, removing the need
+for a hand-tuned weighting coefficient.\footnote{The implementation writes
+this as $\mathcal{L}_{\mathrm{bin}} + 0.5\,(\mathrm{CE}_x + \mathrm{CE}_y)$,
+which is algebraically identical to summing $\mathcal{L}_{\mathrm{bin}}$
+with the mean of the two camera cross-entropies as expressed here.}
+
+\subsection{Optimisation}
+Only the action head parameters $\theta$ receive gradient updates; the
+frozen backbone parameters remain unchanged throughout. I optimise with Adam
+(learning rate $\eta = 10^{-3}$, default $\beta = (0.9, 0.999)$, no weight
+decay) for 10 epochs at a batch size of 256 under a constant learning-rate
+schedule, with no gradient clipping or warm-up. Because the head is trained
+against pre-extracted features (Section~\ref{caching}), no mixed-precision
+autocast is applied at this stage: the cached \texttt{fp16} features are cast
+to \texttt{fp32} and the head trains entirely in \texttt{fp32}. I select the
+final checkpoint by the epoch with the highest validation movement-$F_1$, the
+mean $F_1$ over the locomotion keys (back, forward, jump, left, right,
+sprint), since the attack key saturates early and is not discriminative for
+model selection.
+
+\subsection{Two-Stage Training with Cached Features} \label{caching}
+Running the backbone end-to-end for every training step is prohibitively
+expensive: a LLaVA forward pass costs on the order of $15$~ms per sample,
+and running the full ablation end-to-end would cost roughly $53$ times the
+cached pipeline. Because the backbone is frozen, however, its output
+$\phi(s_t, p)$ depends only on $(s_t, p)$, both of which are fixed across all
+head-training runs for a given dataset and language condition. I therefore
+exploit this invariance with a two-stage training pipeline.
+
+\paragraph{Stage 1: feature caching.} For each backbone-and-language cell I
+precompute $\phi(s_t, p)$ for every frame in $\mathcal{D}$ (at the production
+frame-stride of 4) and store the resulting embeddings as an \texttt{fp16}
+memory-mapped array, accompanied by a JSON sidecar that pins the sample
+ordering and the cache configuration. This yields four caches in total, and
+the backbone runs exactly once per cache. The no-prompt condition is not
+produced by feeding an empty prompt: for LLaVA the full prompt is always
+passed through the decoder and only the pooled text component is zeroed after
+pooling, while for CLIP the text branch is replaced by a zero vector
+(Section~\ref{ablation}). Building a cache costs roughly $6$~hours for LLaVA
+and roughly $1.5$~hours for the CLIP baseline.
+
+\paragraph{Stage 2: head training.} The action head is then trained against
+the cached features at MLP speed, orders of magnitude faster than an
+end-to-end forward pass. Crucially, the cache is invariant to the past-action
+window size $K$ and the chunk size $N$, since both affect only the head, not
+the backbone. The same cached features therefore serve every head-architecture
+variant explored in the ablation. With the cache in place, head training
+itself costs on the order of $0.5$ to $2$~hours per cell, leaving the
+one-time cache build as the dominant cost of the whole ablation.
+
+\section{Data Pipeline}
+
+\subsection{Dataset}
+Demonstrations come from recorded gameplay on two tasks,
+\texttt{chop\_a\_tree} and \texttt{collect\_dirt}. The trajectories are not
+human recordings: they are real MineRL point-of-view renders produced by a
+STEVE-1 / VPT agent~\cite{lifshitz2023steve1, baker2022vpt} driving the live
+game engine through the MineDreamer \texttt{play} pipeline, so the frames are
+genuine engine output rather than generative-model imagery.
+% Provenance confirmed (verification_paper.md): real MineRL engine renders from a
+% MineDreamer play run driven by STEVE-1/VPT (in_model vpt/2x.model, in_weights
+% steve1.weights), not diffusion. NOTE: dbstmpl.bib is still the stock LMU
+% template, so no MineDreamer key exists and ALL cite keys here are currently
+% undefined; the bibliography must be populated before the chapter compiles
+% (see open-items block).
+Each trajectory consists of a $20$~FPS, $360 \times 640$ MP4 video paired
+with a per-frame action log in JSON format and a single task-prompt string in
+the trajectory metadata; frames and actions are aligned one-to-one. Because
+the generating policy is VPT-based, the recorded camera magnitudes already
+coincide with the mu-law bin centres of Section~\ref{action_space}, so
+discretisation to the 11-bin representation is lossless.
+
+In total the combined dataset comprises $2{,}081$ trajectories --- $1{,}065$ for
+\texttt{chop\_a\_tree} and $1{,}016$ for \texttt{collect\_dirt} --- of $3{,}000$
+frames each, for $6{,}243{,}000$ frames or roughly $87$~hours of $20$~FPS play,
+split almost evenly between the two tasks ($51.2\%$ chop, $48.8\%$ dirt). The
+near-even task balance matters for the language ablation of
+Section~\ref{ablation}: because the prompt is tied to whichever task a trajectory
+belongs to, a balanced corpus ensures that a model which conditions on the prompt
+cannot simply be exploiting a frequency prior over the two prompt strings. At the
+production frame-stride of $4$ this yields the $1{,}560{,}750$ cached training
+samples per cell used in Section~\ref{caching}.
+
+\paragraph{Channel ordering.} The training videos were written with the red
+and blue channels swapped, an artefact of saving frames through OpenCV, which
+expects BGR rather than RGB byte order, so the policy is trained on
+R/B-swapped frames. The same swap is therefore applied to the live
+observation at rollout time, making it the only systematic difference between
+the training and evaluation frame distributions.
+
+\subsection{Frame Loading}
+Whenever the backbone consumes raw frames, that is during the one-time cache
+build and the end-to-end sanity path, frames are decoded on demand from the
+source MP4 using \texttt{decord.VideoReader} inside the PyTorch
+\texttt{Dataset} rather than pre-extracted to disk as PNG or HDF5. Each
+DataLoader worker maintains its own LRU cache of recently opened video
+readers (default size $64$), so the amortised random-access latency per frame
+is in the $3$ to $5$~ms range, well below the backbone forward pass and thus
+invisible in end-to-end timing. This avoids both the disk-space blow-up and
+the inode-explosion problems of materialised frame extraction. Head training
+reads pre-pooled features from the cache (Section~\ref{caching}) and does not
+decode frames.
+
+\subsection{Data Split} \label{sec:split}
+The dataset is split into training, validation, and test sets with approximate
+proportions $80\% / 10\% / 10\%$, using a fixed random seed (42) for
+reproducibility. The
+split is performed at the \emph{trajectory} level rather than the frame level:
+every frame of a given trajectory is assigned to exactly one of the three
+sets. This is deliberate. Adjacent frames in Minecraft gameplay are visually
+near-identical, so a frame-level split would scatter near-duplicates of test
+frames into the training set and inflate held-out metrics through leakage.
+Trajectory-level splitting holds the training and test trajectories strictly
+disjoint, so the offline metrics of Section~\ref{sec:rollout} measure
+generalisation to unseen trajectories rather than memorisation of neighbouring
+frames. I additionally rely on the in-environment rollout evaluation of
+Section~\ref{sec:rollout} as a still stronger test: rollout episodes execute
+the policy in freshly generated worlds that share no frames with any
+trajectory in $\mathcal{D}$, probing out-of-distribution behaviour beyond what
+any held-out split of the recorded data can capture.
+
+\section{Rollout Evaluation} \label{sec:rollout}
+
+\subsection{Inference Loop}
+At evaluation time the trained head is paired with its frozen backbone and
+deployed in the MineRL environment $\mathcal{E}$. Each episode maintains a
+fixed-length deque of the last $K = 8$ executed actions, zero-initialised at
+$t = 0$. At each timestep the agent encodes the current frame and prompt to
+obtain $\phi(s_t, p)$, concatenates the past-action buffer, and forwards
+through the head to produce a chunked logit tensor of shape $(1, N, D)$.
+Only the first chunk step is decoded into an environment action. I decode
+\emph{stochastically}: each binary key is sampled from a Bernoulli with
+probability $\sigma(z / \tau)$, and each camera axis is sampled from a
+categorical over its 11 bins via $\mathrm{softmax}(z / \tau_{\mathrm{cam}})$
+before the mu-law inverse maps the chosen bin back to degrees. I use
+$\tau = 1.0$ for the binary keys and a higher camera temperature
+$\tau_{\mathrm{cam}} = 2.0$, which flattens the dominant zero-magnitude bin so
+the agent looks around rather than fixating on the most frequent
+\enquote{no turn} action; a greedy variant (binary threshold at $0.5$, camera
+\texttt{argmax}) is available but tends to collapse the camera onto the null
+bin. The resulting action is merged into the environment's no-op template
+(which fills in components such as \texttt{pickItem} and \texttt{swapHands}
+that the policy does not predict), executed in $\mathcal{E}$, appended to the
+past-action buffer as a one-hot vector, and the cycle repeats. The policy
+therefore re-plans on every tick; the remaining $N - 1$ chunk steps act only
+as auxiliary supervision during training (Section~\ref{chunking}) and are
+discarded at rollout.
+
+\subsection{Evaluation Metrics}
+I report two complementary classes of metric, and treat the online rollout
+statistics as primary.
+
+Offline frame-level metrics are computed against the held-out test split of
+Section~\ref{sec:split}: per binary key I report precision, recall, and
+$F_1$, and for each camera axis I report top-1 bin accuracy and mean absolute
+error in degrees after decoding. These provide a cheap signal during
+development but are known to correlate weakly with downstream task success
+\cite{kanervisto2020}.
+
+Online rollout metrics are evaluated across a fixed number of episodes per
+cell. The primary instrument is the \emph{per-action firing rate}, the
+fraction of steps at which each binary key fires, measured per condition; I
+compare firing rates across conditions using Wilson confidence intervals, a
+two-proportion $z$-test with multiple-comparison correction, and an
+effect-size threshold, so a difference must be both statistically and
+practically meaningful to count. I favour firing-rate statistics over episode
+reward because the in-environment reward signal is both systematically broken on
+the chop task and a small sample at the episode counts that are computationally
+affordable: reward must be recomputed from inventory deltas because the engine's
+item-collection reward handler watches the generic item name \texttt{log} while
+chopping yields per-wood names such as \texttt{oak\_log} and \texttt{birch\_log},
+so it never increments for the chop task in this stack, and even on the working
+dirt task ten episodes is a small sample over ten distinct world seeds. The
+environment is itself seed-deterministic --- an identical seed reproduces a
+rollout exactly --- so the per-episode spread is sampling variance over worlds,
+not irreproducibility. As a reward-independent measure of task progress I track the per-item
+\emph{peak inventory}, the running maximum count of the goal item (a log or a
+dirt block) over an episode, alongside the recomputed episode reward and
+success rate reported for completeness. As a sanity floor I record the
+action-frequency distribution and compare it against a random-policy baseline
+run in the same environments, confirming that the trained agents diverge from
+chance (Chapter~\ref{chap:experiments}).
+% [RESOLVED 2026-06-24] random-policy baseline now logged at
+% evaluations/paper/random_baseline/ (chop+dirt, 10 episodes each, seed 0;
+% binary key flip p=0.1, camera ~U(-5,5)). Floor ~10%/key, 0 logs / 0 dirt
+% collected; reported in Chapter~\ref{chap:experiments} (Sec. Experimental Setup,
+% Fig. action profile). The stronger "I ... confirm ... diverge from chance"
+% wording is therefore restored above.
+
+\section{Ablation Design} \label{ablation}
+
+To disentangle the contribution of the joint vision-language backbone from
+the contribution of the language prompt itself, I run a $2 \times 2$
+factorial ablation over backbone $\in \{\text{LLaVA}, \text{CLIP}\}$ and
+language condition $\in \{\text{prompt}, \text{no prompt}\}$, giving four
+head-training cells. All four cells are trained on the \emph{combined}
+two-task dataset (\texttt{chop\_a\_tree} and \texttt{collect\_dirt} pooled
+together), not on either task in isolation. Training on the combined set is
+what makes language conditioning a non-trivial question at all: on a single
+task the prompt is constant, so for the contrastive baseline it would fold
+into a fixed head bias and the prompt-versus-no-prompt comparison would be
+vacuous.
+
+Across all four cells the temporal recipe (past-action conditioning with
+$K = 8$ and action chunking with $N = 8$), the head hidden width, the
+optimiser, the frame stride, the trajectory-level split, and the
+model-selection criterion are held identical; only the backbone identity and
+the language condition vary, so that neither backbone is handicapped by the
+comparison.
+
+The four cells are:
+\begin{itemize}
+    \item \textbf{Exp 1}, LLaVA with prompt: the full model
+          (Section~\ref{sec:backbone}).
+    \item \textbf{Exp 2}, CLIP with prompt: the contrastive baseline with
+          access to the same language signal.
+    \item \textbf{Exp 3}, LLaVA without prompt: the prompt is still passed
+          through the decoder, but the pooled text component is zeroed after
+          pooling (see below).
+    \item \textbf{Exp 4}, CLIP without prompt: the text branch is replaced by
+          a zero embedding while the head input shape is held unchanged
+          (Section~\ref{sec:clip_baseline}).
+\end{itemize}
+
+\paragraph{What the language ablation removes, per backbone.} The no-prompt
+condition is not implemented identically across the two backbones, and the
+asymmetry matters for interpretation. For CLIP, the image and text encoders
+are separate, so zeroing the text branch removes language from the
+representation entirely: the image features never attended to the prompt. For
+LLaVA, the prompt is always passed through the decoder and only the pooled
+text component is zeroed afterwards (Section~\ref{sec:backbone}). Because
+LLaVA fuses the modalities inside the decoder, the pooled \emph{image}
+component has already attended to the prompt and so remains prompt-conditioned
+even in the no-prompt cell. The LLaVA language ablation therefore removes the
+explicit text vector but not the prompt's influence on the visual
+representation, whereas the CLIP ablation removes language completely.
+
+\paragraph{What each comparison isolates.} Exp 1 versus Exp 2 holds the
+language signal fixed and varies only the backbone, isolating the value of
+joint vision-language fusion against a contrastive encoder; this is the
+cleanest contrast the design supports. Exp 1 versus Exp 3, and Exp 2 versus
+Exp 4, each measure the marginal value of the prompt within a single backbone,
+and Exp 3 versus Exp 4 compares the two backbones as pure visual feature
+extractors. One caveat must be stated plainly: because all cells are trained
+on the combined dataset, the prompt also carries the identity of the task.
+The within-backbone prompt comparisons therefore measure the total value of
+the prompt, including its role as a task-disambiguation signal, and cannot on
+their own attribute any gain specifically to language reasoning. This is a
+deliberate consequence of keeping the design a tidy $2 \times 2$: a fifth cell
+supplying task identity through a non-linguistic one-hot signal would have
+separated the two effects, but I do not include it. The overarching question
+the design poses is whether a frozen joint vision-language model earns its
+keep over a frozen contrastive one when both are used only as feature
+extractors for behavioural cloning, and whether either backbone makes
+meaningful use of the language pathway under this training regime.
+
+\section{Implementation Details}
+The system is implemented in PyTorch on Python 3.12. Feature caching and head
+training run on a rented NVIDIA RTX 5090, using \texttt{bf16} compute with
+% Hardware/stack confirmed (verification_paper.md): RTX 5090 (Blackwell, sm_120),
+% torch 2.7 from the cu128 index (CUDA 12.8), bf16 + SDPA, no FlashAttention-2.
+% The A5000/Abaki path is deprecated (QoS revoked 2026-06-06); the four reported
+% cells are stride-4 LLaVA/CLIP runs consistent with the 5090 build.
+scaled-dot-product attention for the LLaVA backbone (the Blackwell
+architecture has no FlashAttention-2 kernel). Rollout evaluation runs in a
+Dockerised MineRL environment. The full codebase, including the cache
+pipeline, training loop, and rollout harness, is available at
+\url{https://github.com/DACN-1/MC-AI}.
+
+% =====================================================================
+% OPEN ITEMS (Method) -- status after verification_paper.md (2026-06-23),
+% which dumped the four reported checkpoint configs directly from model_best.pt.
+% ---------------------------------------------------------------------
+% RESOLVED -- confirmed against source AND the four reported checkpoints
+% {llava,clip}_combined_{lang,nolang}_stride4_tsplit[_base]:
+%  * hidden_dim=2048 in all four; head params exactly 18,188,632 (LLaVA) /
+%    4,557,144 (CLIP); trained head is the cached HeadOnlyAgent, hidden width
+%    held constant across backbones (NOT the 768-wide frozen_vision_baseline head).
+%  * split_by_trajectory=true AND keep_best=true in all four. Cite THESE as the
+%    reported 2x2; the legacy frame-level clip_combined_lang_stride4 must NOT be
+%    cited (it would reintroduce the leakage Section~\ref{sec:split} avoids).
+%  * Every optional knob off in all four: weighted_loss, learnable_bce_temp,
+%    focal_gamma, past_action_slot_dropout, cam_weighted_loss, frame_history_k,
+%    feature_norm/FiLM, image_dropout, patch_grid. (Head state-dict is exactly a
+%    plain Linear->ReLU->Linear; CLIP feature_dim=1536=2x768 proves patch_grid=0.)
+%  * Provenance (STEVE-1/VPT via MineDreamer play) confirmed.
+%  * Hardware/stack: RTX 5090, torch 2.7 / cu128 (CUDA 12.8), bf16 + SDPA, no FA2.
+%  * Loss (BCE + 0.5*(CE_x+CE_y)), Adam lr=1e-3 / batch 256 / 10 epochs / constant
+%    LR / no wd-clip-warmup, fp16 cache -> fp32, model selection by val movement-F1,
+%    decode (binary tau=1.0, camera tau=2.0 via eval_suite.sh), stride 4, four
+%    combined-dataset caches: all confirmed.
+%  * shah2021basalt correctly absent and uncited (data are VPT-agent rollouts).
+%  * Python version corrected above to 3.12 (stack validated on 3.12; 3.10 is
+%    unavailable on LMU CIP).
+% ---------------------------------------------------------------------
+% STILL OPEN:
+%  1. Bibliography: dbstmpl.bib is still the stock LMU template. NONE of the 10
+%     \cite keys here exist (Bain1995AFF, ross2011,
+%     kumar2022finetuningdistortpretrainedfeatures,
+%     li2023blip2bootstrappinglanguageimagepretraining,
+%     liu2024improvedbaselinesvisualinstruction, radford2021clip, baker2022vpt,
+%     tavakoli2018actionbranching, lifshitz2023steve1, kanervisto2020), and there
+%     is no MineDreamer entry. The .bib must be populated before the chapter
+%     compiles.
+%  2. Random-policy baseline (see [VERIFY] in Evaluation Metrics): confirm a run
+%     was logged, or keep the softened wording.
+% ---------------------------------------------------------------------
+% NOTE on the controllability protocol (not in this chapter): the registered envs
+% are task-specific single biomes (MineRLChopATree640-v0 = forest,
+% MineRLCollectDirt640-v0 = plains); no generic world with both trees and dirt
+% exists in eval_envs.py and would need registering. A log breaks within the
+% rollout budget under the *Fast* variants (BreakSpeedMultiplier=5.0, shared by
+% both ...Fast-v0 and ...FastAim-v0); FastAim additionally sets start_pitch=20.0.
+% =====================================================================

@@ -1,0 +1,77 @@
+% ======================================================================
+% Chapter 1 -- Introduction
+% Target: ~1 page (single section, no subsections).
+% PST "classic drama" arc: setting -> problem -> why existing means fall
+% short -> approach -> how it solves it (+ contributions) -> outline.
+% Present tense, active voice, "we"/"one" (not "I"). VLM not LLM,
+% "frozen" not "fine-tuning".
+% ======================================================================
+
+\chapter{Introduction}
+\label{chap:intro}
+
+Vision-language models acquire broad visual and semantic priors from
+large-scale pretraining, yet they are optimised to produce text rather
+than to act. Converting that perceptual competence into the ability to
+pursue goals inside an interactive environment remains an open problem.
+
+A common route turns a vision-language model into an agent by
+post-training the entire backbone on action data, as JARVIS-VLA does for
+Minecraft \cite{li2025jarvisvla}. This ties the model's knowledge to a
+single embodiment and demands substantial compute. Full fine-tuning is
+also risky in itself: updating a strong pretrained backbone can distort
+the very features it depends on and weaken out-of-distribution behaviour
+\cite{kumar2022finetuningdistortpretrainedfeatures}. Established Minecraft
+agents show the two prevailing alternatives, either training a large
+control policy from scratch on human video \cite{baker2022vpt} or
+bypassing pixel control through symbolic scripting interfaces. Neither
+isolates how much agent competence already resides in a frozen,
+general-purpose backbone.
+
+This thesis introduces R1V-A, an agent that keeps the vision-language
+backbone entirely frozen and trains only a small action head, on the
+order of five million parameters, by behavioural cloning on recorded
+Minecraft gameplay (rendered by a STEVE-1/VPT agent, not a human; see
+Chapter~\ref{chap:method}). Each decision is conditioned on a single rendered
+frame together with a natural-language task prompt, and no reward signal
+is used during training.
+
+Because the backbone never changes, its features can be computed once and
+reused, which makes training cheap enough to sweep several configurations.
+The frozen design also turns the backbone into a controlled variable,
+which we exploit to make three contributions. First, we compare a joint
+vision-language backbone (LLaVA-1.5) against a contrastive one (CLIP) used
+purely as frozen feature extractors. Second, we ablate the language
+pathway by training each backbone with and without the task prompt, asking
+whether the prompt adds signal over image-only control. Third, we evaluate
+the resulting agents not only on held-out frames but in live MineRL
+rollouts, which probe the out-of-distribution behaviour that frame-level
+metrics overlook.
+
+Concretely, the thesis poses three research questions, one per contribution:
+\begin{itemize}
+\item \textbf{RQ1 (backbone).} Used only as a frozen feature extractor for a
+small behavioural-cloning head, does a joint vision-language backbone
+(LLaVA-1.5) yield a more capable Minecraft agent than a contrastive one (CLIP)?
+\item \textbf{RQ2 (language).} Does conditioning the head on a natural-language
+task prompt measurably change the agent's behaviour, and does the answer depend
+on the backbone?
+\item \textbf{RQ3 (evaluation).} Do live in-environment rollouts reveal
+differences between these agents that held-out frame-level metrics do not?
+\end{itemize}
+
+The remainder of this thesis is organised as follows.
+Chapter~\ref{chap:background} reviews the imitation-learning setting the
+agent operates in, Minecraft as a control benchmark, the frozen
+vision-language backbone and the rationale for freezing it, the
+vision-language-action lineage the design descends from, and the factored
+action space it predicts over. Chapter~\ref{chap:method} details the
+problem formulation, the frozen-backbone architecture and trainable action
+head, the training objective, the data pipeline, and the
+rollout-evaluation protocol. Chapter~\ref{chap:experiments} reports the
+$2\times2$ backbone-by-language ablation across both tasks, with
+frame-level metrics and in-environment rollout results.
+Chapter~\ref{chap:discussion} interprets these results, in particular what
+they imply about the contribution of the language pathway and the choice
+of frozen backbone. Chapter~\ref{chap:conclusion} summarises the findings
+and outlines directions for future work.

@@ -664,6 +664,7 @@ def train_vla(
     restart: bool = False,
     weighted_loss: bool = False,
     history_dropout: float = 0.0,
+    seed: int = 0,
 ):
     """Train the VLA action head and return (model, test_subset, history).
 
@@ -714,6 +715,9 @@ def train_vla(
         json.dump(test_info, f, indent=2)
     print(f"Test set info saved to: {test_info_path}")
 
+    train_gen = th.Generator()
+    train_gen.manual_seed(seed)
+    print(f"Training seed = {seed} (train/val/test split seed fixed at 42)")
     train_loader = DataLoader(
         train_set,
         batch_size=batch_size,
@@ -721,6 +725,7 @@ def train_vla(
         num_workers=num_workers,
         collate_fn=_collate,
         persistent_workers=num_workers > 0,
+        generator=train_gen,
     )
     val_loader = DataLoader(
         val_set,
@@ -732,6 +737,7 @@ def train_vla(
     )
 
     past_action_dim = past_action_k * PAST_ACTION_DIM
+    th.manual_seed(seed)
     model = VLAAgent(
         NUM_OUTPUT_LOGITS,
         backbone,
@@ -959,6 +965,7 @@ def train_cached_head(
     stem_filter: str | None = None,
     camera_onset_weight: float = 1.0,
     camera_onset_window: int = 8,
+    seed: int = 0,
 ):
     """Train an MLP head on precomputed backbone features.
 
@@ -1132,6 +1139,12 @@ def train_cached_head(
             "(gamma/beta), MLP consumes modulated image only"
         )
 
+    # T1 across-seed: the data-order shuffle is controlled by `seed`; the
+    # train/val/test split above keeps a fixed seed (42) so every seed trains on
+    # the same partition and only head init + batch order vary.
+    train_gen = th.Generator()
+    train_gen.manual_seed(seed)
+    print(f"Training seed = {seed} (train/val/test split seed fixed at 42)")
     train_loader = DataLoader(
         train_set,
         batch_size=batch_size,
@@ -1140,6 +1153,7 @@ def train_cached_head(
         num_workers=num_workers,
         collate_fn=_cached_collate,
         persistent_workers=num_workers > 0,
+        generator=train_gen,
     )
     val_loader = DataLoader(
         val_set,
@@ -1151,6 +1165,9 @@ def train_cached_head(
     )
 
     past_action_dim = past_action_k * PAST_ACTION_DIM
+    # Seed the global RNG immediately before constructing the head so its weight
+    # initialisation depends only on `seed` (not on RNG consumed above).
+    th.manual_seed(seed)
     model = HeadOnlyAgent(
         feature_dim=dataset.feature_dim(),
         output_dim=NUM_OUTPUT_LOGITS,
@@ -1223,6 +1240,7 @@ def train_cached_head(
                     "lr_schedule": lr_schedule,
                     "camera_onset_weight": camera_onset_weight,
                     "camera_onset_window": camera_onset_window,
+                    "seed": seed,
                     "camera_quantizer": {
                         "camera_maxval": DEFAULT_CAMERA_QUANTIZER.camera_maxval,
                         "camera_binsize": DEFAULT_CAMERA_QUANTIZER.camera_binsize,
@@ -1596,6 +1614,13 @@ if __name__ == "__main__":
         help="Probability of zeroing the whole past-action vector per training "
         "sample (breaks the no-move feedback trap; e.g. 0.5)",
     )
+    p.add_argument(
+        "--seed",
+        type=int,
+        default=0,
+        help="Training seed for head init + data-order shuffle (T1 across-seed "
+        "variance); the train/val/test split stays fixed regardless",
+    )
     a = p.parse_args()
 
     model, test_set, _ = train_vla(
@@ -1615,6 +1640,7 @@ if __name__ == "__main__":
         restart=a.restart,
         weighted_loss=a.weighted_loss,
         history_dropout=a.history_dropout,
+        seed=a.seed,
     )
     if a.evaluate_after and len(test_set) > 0:
         evaluate(

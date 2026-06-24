@@ -8,6 +8,11 @@
 #   B_chop_ood        env=MineRLChopATree640Fast-v0  prompt="Play Minecraft."
 #   C_chop_task       env=MineRLChopATree640Fast-v0  prompt="chop a tree"
 #   D_dirt_task       env=MineRLCollectDirt640Fast-v0  prompt="collect dirt"
+#   E_dirt_nocap      env=MineRLCollectDirt640Fast-v0  prompt=""   (opt-in; T3)
+#
+# E (dirt env + empty prompt) is NOT in the default allowlist; it isolates the
+# environment from the prompt in the D-vs-E contrast (last_refinements.md T3).
+# Run it with:  CONDITIONS="E_dirt_nocap" bash scripts/eval_suite.sh <ckpt> <tag>
 #
 # Each condition: 10 episodes × 1000 steps. Episode i uses seed BASE_SEED+i,
 # identical across conditions and across models — so two models' steps_*.json
@@ -36,8 +41,9 @@ EPISODES="${EPISODES:-10}"
 MAX_STEPS="${MAX_STEPS:-1000}"
 SERVER_PORT="${SERVER_PORT:-8765}"
 DEVICE="${DEVICE:-mps}"
-# Space-separated allowlist of conditions to run (default: all 4). For task-
-# performance screening pass e.g. CONDITIONS="C_chop_task D_dirt_task".
+# Space-separated allowlist of conditions to run (default: the 4 core cells
+# A/B/C/D). E_dirt_nocap is defined but opt-in: pass CONDITIONS="E_dirt_nocap"
+# (T3). For task-performance screening pass e.g. CONDITIONS="C_chop_task D_dirt_task".
 CONDITIONS="${CONDITIONS:-A_chop_nocap B_chop_ood C_chop_task D_dirt_task}"
 # Each suite-run lives under output/evaluation/<endtime>_<modeltag>/. While
 # the run is in flight the dir is .running_<starttime>_<modeltag>/; on a
@@ -133,6 +139,7 @@ run_condition A_chop_nocap MineRLChopATree640Fast-v0   ""
 run_condition B_chop_ood   MineRLChopATree640Fast-v0   "Play Minecraft."
 run_condition C_chop_task  MineRLChopATree640Fast-v0   "chop a tree"
 run_condition D_dirt_task  MineRLCollectDirt640Fast-v0 "collect dirt"
+run_condition E_dirt_nocap MineRLCollectDirt640Fast-v0 ""
 
 # ---------- manifest + rename on success ----------------------------------
 END_TS="$(date +%Y%m%d_%H%M%S)"
