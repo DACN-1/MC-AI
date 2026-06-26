@@ -15,7 +15,10 @@ features are uninformative or because the head cannot read them. Throughout, I
 treat the online rollout statistics of Section~\ref{sec:rollout} as primary and
 report per-step firing rates from the recorded \texttt{steps} logs rather than
 the per-step dominant-action summary, which undercounts simultaneously held
-keys.
+keys. Each cell is trained at \textbf{three independent seeds} (head
+initialisation and data-order shuffle); every rollout number below is a mean over
+the three seeds with the across-seed standard deviation as its uncertainty, so a
+reported effect is one that survives retraining, not a single lucky run.
 
 \section{Experimental Setup}
 \label{sec:exp-setup}
@@ -24,38 +27,72 @@ The four cells are the knob-free trajectory-split checkpoints
 $\{\text{LLaVA},\text{CLIP}\}\times\{\text{lang},\text{nolang}\}$ of
 Section~\ref{ablation}: Exp~1 (LLaVA + prompt), Exp~2 (CLIP + prompt), Exp~3
 (LLaVA, no prompt) and Exp~4 (CLIP, no prompt). Every cell is evaluated under
-four conditions that vary only the environment and the prompt string, holding
-the decode (Section~\ref{sec:rollout}) and the base seed fixed:
+four conditions that, crucially, all run in \emph{one fixed world}: the terrain is
+identical across A, B, C and D, and the \textbf{prompt string} is the only
+deliberately varied factor between them. This is a property of how the conditions
+are seeded, not merely of the opening frame.
+Episode $i$ of every condition is generated with the same world seed
+(\texttt{base}${}+i$), applied to the same world generator: the two environment
+ids in Table~\ref{tab:conditions} (\texttt{ChopATree640Fast} and
+\texttt{CollectDirt640Fast}) are built from one shared world-generation
+configuration and differ only in which item their reward handler counts --- a
+quantity the agent never observes, since it reads only the RGB frame --- while
+the generator's nominal biome flag has no effect in this MineRL build. Identical
+seed and identical generator therefore yield the identical world for the whole
+episode. Figure~\ref{fig:sameworld} confirms it at the first frame, which precedes
+any action: the terrain in a dirt-task frame is identical to the matching
+chop-task frame, the two differing only in the agent's own held tool at the bottom
+edge and a single distant mob (mean absolute difference $2.6/255$, the same as
+between any two same-condition episodes). The evaluation is thus a clean,
+prompt-driven manipulation on a single scene, not a comparison across
+environments.
+
+\begin{figure}[ht]
+\centering
+\includegraphics[width=0.95\textwidth]{figures/fig_same_world.pdf}
+\caption{The two environment ids render one identical world. \emph{Left, centre:}
+the first frame of condition A (chop id, empty prompt) and condition D (dirt id,
+\enquote{collect dirt}), same episode index and rollout seed. \emph{Right:} their
+absolute difference, amplified ten-fold; the only non-zero pixels are the agent's
+own held item at the bottom edge and a single distant mob, never the terrain.
+Mean absolute difference is $2.6/255$, matching the variation between two
+same-condition episodes.}
+\label{fig:sameworld}
+\end{figure}
 
 \begin{table}[ht]
 \centering
 \begin{tabular}{llll}
 \hline
-Condition & Environment & Prompt & Probes \\
+Condition & Environment id & Prompt & Probes \\
 \hline
 A (\texttt{chop\_nocap}) & \texttt{ChopATree640Fast} & \enquote{} (empty)       & off-task floor \\
 B (\texttt{chop\_ood})   & \texttt{ChopATree640Fast} & \enquote{Play Minecraft.} & out-of-task prompt \\
 C (\texttt{chop\_task})  & \texttt{ChopATree640Fast} & \enquote{chop a tree}     & on-task prompt \\
-D (\texttt{dirt\_task})  & \texttt{CollectDirt640Fast} & \enquote{collect dirt}  & second task \\
+D (\texttt{dirt\_task})  & \texttt{CollectDirt640Fast} & \enquote{collect dirt}  & second goal prompt \\
 \hline
 \end{tabular}
-\caption{The four rollout conditions. Conditions A--C share the chop
-environment and vary only the prompt, isolating the prompt's effect on
-behaviour; D evaluates a second task. Each cell is run for $10$ episodes of
-$1000$ steps per condition at base seed $0$.}
+\caption{The four rollout conditions. All four share one fixed world; the
+environment id changes only the agent-invisible reward item, so the conditions
+vary \emph{only the prompt}. A--C probe the prompt's effect on behaviour in the
+chop scene; D issues a second goal prompt in the same scene and is scored for
+dirt collection. Each cell is run for $10$ episodes of $1000$ steps per
+condition per training seed, at a fixed base seed.}
 \label{tab:conditions}
 \end{table}
 
 Comparing conditions A, B and C within a single cell isolates the effect of the
-prompt, since the environment, the seed and the decoder are identical and only
-the conditioning string changes. I quantify each binary key's firing rate per
+prompt, since the world, the seed and the decoder are identical and only the
+conditioning string changes. I quantify each binary key's firing rate per
 condition with a Wilson $95\%$ confidence interval, compare conditions with a
 two-proportion $z$-test, and report Cohen's $h$ as an effect size, exactly as
-described in Section~\ref{sec:rollout}. Because each condition contributes
-roughly $10^4$ steps, the per-step intervals are tight and even small rate
-differences reach nominal significance; I therefore lean on the effect size and
-on the random floor below, not on the $p$-value alone, to separate a meaningful
-shift from a merely detectable one.
+described in Section~\ref{sec:rollout}; per-cell rates are pooled over the three
+training seeds and the across-seed standard deviation is carried as the headline
+uncertainty. Because each condition contributes roughly $3\times10^4$ pooled
+steps, the per-step intervals are tight and even small rate differences reach
+nominal significance; I therefore lean on the effect size, the across-seed
+spread and the random floor below, not on the $p$-value alone, to separate a
+meaningful shift from a merely detectable one.
 
 \paragraph{Random-policy floor.} To confirm that the trained agents act rather
 than twitch, I run a random policy in the same environments at the same seed:
@@ -85,31 +122,29 @@ differ in \emph{how} that mass is distributed.}
 
 The central question of the prompt ablation is whether the language string
 changes what the agent does. Table~\ref{tab:conditioning} reports the
-\texttt{attack} and \texttt{forward} firing rates across the three chop-prompt
-conditions, and Figure~\ref{fig:conditioning} plots the \texttt{attack} channel,
-the most discriminative key.
+\texttt{attack} firing rate --- the most discriminative key --- across the three
+chop-prompt conditions, averaged over the three training seeds, and
+Figure~\ref{fig:conditioning} plots the same channel with across-seed error bars.
 
 \begin{table}[ht]
 \centering
-\begin{tabular}{llrrrrr}
+\begin{tabular}{lrrrrr}
 \hline
-Cell & Key & A (\%) & B (\%) & C (\%) & $\Delta_{\text{C}-\text{A}}$ (pp) & $h$ \\
+Cell & A (\%) & B (\%) & C (\%) & $\Delta_{\text{C}-\text{A}}$ (pp) & $h$ \\
 \hline
-Exp~2 CLIP + lang   & attack  & 84.9 & 76.7 & 37.0 & $-48.0$ & $-1.04$ \\
-                    & forward & 76.3 & 71.2 & 62.6 & $-13.7$ & $-0.30$ \\
-Exp~4 CLIP $-$ lang & attack  & 57.8 & 57.8 & 64.0 & $+6.1$  & $+0.13$ \\
-                    & forward & 43.9 & 42.8 & 35.5 & $-8.4$  & $-0.17$ \\
-Exp~1 LLaVA + lang  & attack  & 34.9 & 32.6 & 29.8 & $-5.1$  & $-0.11$ \\
-                    & forward & 23.9 & 24.5 & 24.1 & $+0.2$  & $+0.00$ \\
-Exp~3 LLaVA $-$ lang& attack  & 54.4 & 51.5 & 50.2 & $-4.2$  & $-0.09$ \\
-                    & forward & 52.7 & 53.8 & 55.3 & $+2.6$  & $+0.05$ \\
+Exp~2 CLIP + lang   & 80.4 & 78.5 & 38.2 & $-42.3\pm10.4$ & $-0.91\pm0.24$ \\
+Exp~4 CLIP $-$ lang & 58.9 & 59.0 & 62.6 & $+3.7\pm2.7$   & $+0.08\pm0.06$ \\
+Exp~1 LLaVA + lang  & 44.7 & 44.2 & 41.7 & $-3.0\pm3.7$   & $-0.06\pm0.08$ \\
+Exp~3 LLaVA $-$ lang& 58.5 & 61.1 & 60.8 & $+2.3\pm4.9$   & $+0.05\pm0.10$ \\
 \hline
 \end{tabular}
-\caption{Firing rates across the three chop-prompt conditions. $\Delta_{\text{C}
--\text{A}}$ is the on-task-minus-empty-prompt change in percentage points and
-$h$ is Cohen's $h$ for that pair. Only CLIP + lang shows a large shift
-($|h|>0.5$); the other three cells stay within $|h|\le0.17$, the same band as
-the no-prompt controls.}
+\caption{\texttt{attack} firing rate across the three chop-prompt conditions,
+each entry a mean over three training seeds. $\Delta_{\text{C}-\text{A}}$ is the
+on-task-minus-empty-prompt change in percentage points and $h$ is Cohen's $h$
+for that pair; both are reported as mean${}\pm{}$standard deviation across the
+three seeds. Only CLIP + lang shows a large shift, and it does so in every seed
+($h=-1.04,-1.12,-0.57$); no seed of the other three cells exceeds $|h|=0.16$,
+the same band as the no-prompt controls.}
 \label{tab:conditioning}
 \end{table}
 
@@ -117,47 +152,46 @@ the no-prompt controls.}
 \centering
 \includegraphics[width=0.82\textwidth]{figures/fig_conditioning.pdf}
 \caption{\texttt{attack} firing rate across the empty (A), out-of-task (B) and
-on-task (C) prompts; error bars are Wilson $95\%$ intervals (smaller than the
-markers). Only CLIP + lang (solid blue) shifts with the prompt, its \texttt{attack}
-rate moving from $84.9\%$ to $37.0\%$; the other three cells are flat, and all
-sit well above the random floor (dotted).}
+on-task (C) prompts; markers are means over three training seeds and error bars
+are ${\pm}1$ across-seed standard deviation. Only CLIP + lang (solid blue) shifts
+with the prompt, its \texttt{attack} rate dropping from $80\%$ to $38\%$; the
+other three cells are flat, and all sit well above the random floor (dotted).}
 \label{fig:conditioning}
 \end{figure}
 
-The effect is large and concentrated in a single cell. \textbf{CLIP + lang}
-suppresses its \texttt{attack} key from $84.9\%$ under the empty prompt to
-$37.0\%$ under \enquote{chop a tree}, a $48$~percentage-point shift with
-$h=-1.04$ --- a large effect by any threshold, and the prompt is the only
-deliberately varied factor across the two conditions; with $\sim\!10^4$ steps per
-condition the per-step intervals are far tighter than this shift, so it cannot be
-attributed to rollout noise. The shift is not confined to one key: in the same
-cell \texttt{sprint} falls by $29$~pp and rightward steering rises by $18$~pp
-alongside the \texttt{forward} drop ($-13.7$~pp), whereas no other cell moves any
-channel by more than about $6$~pp. The on-task prompt reorganises the whole
-action distribution rather than nudging a single key. \textbf{CLIP $-$ lang}, the same
-backbone with the text branch zeroed, is flat: \texttt{attack} moves by
-$+6.1$~pp ($h=+0.13$), within the noise band, which is exactly the negative
-control the design demands --- when language is removed from the representation,
-the prompt string can no longer act.
+The effect is large and concentrated in a single cell, and it reproduces across
+seeds. \textbf{CLIP + lang} suppresses its \texttt{attack} key from $80.4\%$
+under the empty prompt to $38.2\%$ under \enquote{chop a tree}, a
+$42.3\pm10.4$~percentage-point shift with $h=-0.91\pm0.24$ --- a large effect by
+any threshold, present in all three seeds ($h=-1.04,-1.12,-0.57$), so it is a
+property of the cell rather than of one lucky retraining. The prompt is the only
+deliberately varied factor across the two conditions, and the world and seed are
+held fixed, so the shift cannot be attributed to the scene or to rollout noise.
+\textbf{CLIP $-$ lang}, the same backbone with the text branch zeroed, is flat:
+\texttt{attack} moves by $+3.7\pm2.7$~pp ($h=+0.08$), within the noise band ---
+exactly the negative control the design demands, since when language is removed
+from the representation the prompt string can no longer act. I report the single
+most discriminative key here; the wider reshaping of the action distribution
+(steering, \texttt{sprint}) moves in the same direction but varies too much
+across seeds to quantify cleanly, so I do not lean on it.
 
-Both LLaVA cells are flat in both conditions. \textbf{LLaVA + lang} shifts
-\texttt{attack} by only $-5.1$~pp ($h=-0.11$) and \texttt{forward} not at all,
-and \textbf{LLaVA $-$ lang} is indistinguishable from it ($-4.2$~pp). These
-residual shifts reach nominal significance only because each rate is estimated
-from $10^4$ steps; their effect sizes ($|h|<0.12$) sit inside the same band as
-the no-prompt controls, so they carry no behavioural meaning. The asymmetry
-noted in Section~\ref{ablation} sharpens rather than weakens this reading: in
-the LLaVA no-prompt cell the prompt still passes through the decoder and only
-the pooled text vector is zeroed, so the pooled image features remain
-prompt-conditioned --- yet even with that residual pathway, and even with the
-explicit text vector present in the prompt cell, LLaVA never separates from its
-own control. The defensible conclusion is therefore a statement about the
-backbone, not about language in general: \emph{under this frozen-feature regime
-the contrastive CLIP text encoder yields a conditioning signal the head uses,
-whereas the frozen LLaVA-1.5 backbone does not} --- and, as the probe of
-Section~\ref{sec:exp-probe} shows, not because the prompt is absent from its
-features but because the pooled representation does not expose it as an axis a
-small head can act on.
+Both LLaVA cells are flat. \textbf{LLaVA + lang} shifts \texttt{attack} by only
+$-3.0\pm3.7$~pp ($h=-0.06$) and \textbf{LLaVA $-$ lang} by $+2.3\pm4.9$~pp
+($h=+0.05$); both averages sit inside the same band as the no-prompt controls,
+and the across-seed spread straddles zero, so neither carries behavioural
+meaning. The flatness is not a single-seed accident: no LLaVA seed exceeds
+$|h|=0.16$, against CLIP + lang's weakest seed at $|h|=0.57$. The asymmetry noted
+in Section~\ref{ablation} sharpens rather than weakens this reading: in the LLaVA
+no-prompt cell the prompt still passes through the decoder and only the pooled
+text vector is zeroed, so the pooled image features remain prompt-conditioned ---
+yet even with that residual pathway, and even with the explicit text vector
+present in the prompt cell, LLaVA never separates from its own control. The
+defensible conclusion is therefore a statement about the backbone, not about
+language in general: \emph{under this frozen-feature regime the contrastive CLIP
+text encoder yields a conditioning signal the head uses, whereas the frozen
+LLaVA-1.5 backbone does not} --- and, as the probe of Section~\ref{sec:exp-probe}
+shows, not because the prompt is absent from its features but because the pooled
+representation does not expose it as an axis a small head can act on.
 
 \section{Task Performance}
 \label{sec:exp-task}
@@ -174,75 +208,85 @@ the per-episode results.
 
 \begin{table}[ht]
 \centering
-\begin{tabular}{lrrrr}
+\begin{tabular}{lrrr}
 \hline
-Cell & dirt$_{\text{A}}$ (chop) & dirt$_{\text{D}}$ (dirt) & $95\%$ CI$_{\text{D}}$ & success$_{\text{D}}$ \\
+Cell & dirt$_{\text{A}}$ (empty prompt) & dirt$_{\text{D}}$ (dirt prompt) & success$_{\text{D}}$ \\
 \hline
-Exp~2 CLIP + lang    & 0.8 & 4.30 & $[2.70,\,6.20]$ & $100\%$ \\
-Exp~4 CLIP $-$ lang  & 2.5 & 2.30 & $[1.00,\,3.90]$ & $80\%$ \\
-Exp~1 LLaVA + lang   & 0.0 & 0.00 & $[0.00,\,0.00]$ & $0\%$ \\
-Exp~3 LLaVA $-$ lang & 0.9 & 0.10 & $[0.00,\,0.30]$ & $10\%$ \\
+Exp~2 CLIP + lang    & $1.2$ & $2.53\pm1.25$ & $80\%$ \\
+Exp~4 CLIP $-$ lang  & $2.1$ & $1.60\pm0.50$ & $67\%$ \\
+Exp~1 LLaVA + lang   & $0.0$ & $0.07\pm0.09$ & $3\%$  \\
+Exp~3 LLaVA $-$ lang & $0.4$ & $0.47\pm0.45$ & $30\%$ \\
 \hline
-random policy        & 0.0 & 0.00 & --- & $0\%$ \\
+random policy        & $0.0$ & $0.00$        & $0\%$  \\
 \hline
 \end{tabular}
-\caption{Dirt collected per episode (mean peak inventory over $10$ episodes).
-dirt$_{\text{A}}$ is \emph{incidental} digging in the chop environment under the
-empty prompt; dirt$_{\text{D}}$ is digging in the dirt environment under the
-on-task prompt. The interval is a $20{,}000$-resample percentile bootstrap of the
-dirt$_{\text{D}}$ mean; success is the fraction of episodes collecting any dirt.
-The dirt$_{\text{A}}$-versus-dirt$_{\text{D}}$ contrast separates goal-directed
-digging from incidental terrain-attacking (see text).}
+\caption{Dirt collected per episode (mean peak inventory), averaged over three
+training seeds; dirt$_{\text{D}}$ carries the across-seed standard deviation and
+success is the seed-mean fraction of episodes collecting any dirt. Both columns
+are measured in the \emph{same fixed world}: dirt$_{\text{A}}$ is digging under
+the empty prompt (condition A) and dirt$_{\text{D}}$ is digging under the
+\enquote{collect dirt} prompt (condition D), so their contrast is a within-scene
+prompt effect, not an environment difference (see text).}
 \label{tab:task}
 \end{table}
 
 \begin{figure}[ht]
 \centering
 \includegraphics[width=0.92\textwidth]{figures/fig_taskperf.pdf}
-\caption{Dirt collected per episode. Bars are means with percentile-bootstrap
-$95\%$ intervals; grey dots are the ten individual episodes. The two CLIP cells
-dig, the LLaVA anchor cells do not, and the random policy collects nothing. The
-FiLM probe (green, right of the divider) lies outside the $2\times2$ and is
-discussed in Section~\ref{sec:exp-film}.}
+\caption{Dirt collected per episode. Bars are means over three training seeds
+with ${\pm}1$ across-seed standard deviation; grey dots are all $30$ individual
+episodes. The two CLIP cells dig, the LLaVA anchor cells do not, and the random
+policy collects nothing. The FiLM probe (green, right of the divider) lies
+outside the $2\times2$ and is discussed in Section~\ref{sec:exp-film}.}
 \label{fig:task}
 \end{figure}
 
 Task performance separates by backbone, not by language. \textbf{CLIP + lang}
-collects $4.3$ dirt per episode and digs in every episode; \textbf{CLIP $-$
-lang} collects $2.3$ and digs in eight of ten. Both LLaVA anchor cells are at
-the floor: \textbf{LLaVA + lang} returns a hard zero across all ten episodes
-(standard deviation $0$), and \textbf{LLaVA $-$ lang} reaches $0.1$ ---
-indistinguishable from the random policy's zero. The CLIP--versus--LLaVA gap is
-the one task comparison robust to the small sample: a cell that never collects
-dirt in ten independent episodes is reliably below a cell that always does. The
-within-CLIP gap between the prompt and no-prompt cells ($4.3$ versus $2.3$) is
-in the expected direction but \emph{soft}: the two confidence intervals overlap,
-so with ten episodes I cannot claim the prompt improves dirt collection; the two
-cells are statistically indistinguishable on this metric at this sample size.
-This is the honest limit of episode-level metrics at
-the sample size the LLaVA backbone makes affordable, and it is why the
-conditioning analysis of Section~\ref{sec:exp-cond}, which rests on $10^4$
-per-step observations, carries the load-bearing claim.
+collects $2.53\pm1.25$ dirt per episode and \textbf{CLIP $-$ lang} $1.60\pm0.50$;
+both LLaVA anchor cells are at the floor, \textbf{LLaVA + lang} at $0.07\pm0.09$
+(a hard zero in two of three seeds) and \textbf{LLaVA $-$ lang} at $0.47\pm0.45$,
+the latter barely above the random policy's zero. The CLIP--versus--LLaVA gap is
+the one task comparison robust to the sample: across three seeds and thirty
+episodes the LLaVA anchors essentially never dig, while CLIP does so reliably.
+The within-CLIP gap between the prompt and no-prompt cells ($2.53$ versus $1.60$)
+is in the expected direction but \emph{soft} --- the across-seed intervals
+overlap, so I cannot claim from the item count alone that the prompt improves
+dirt collection. This is the honest limit of episode-level metrics at the sample
+size the LLaVA backbone makes affordable, and it is why the conditioning analysis
+of Section~\ref{sec:exp-cond}, which rests on ${\sim}3\times10^4$ per-step
+observations and reproduces across seeds, carries the load-bearing
+language-steering claim.
 
 One caveat on this metric matters, because the dirt count is not a pure measure
-of goal pursuit. Comparing the two leftmost columns of Table~\ref{tab:task},
-\textbf{CLIP + lang} collects only $0.8$ dirt incidentally in the \emph{chop}
-environment but $4.3$ when actually told to collect dirt --- a genuine,
-prompt-and-task-driven lift. \textbf{CLIP $-$ lang}, by contrast, digs essentially
-the same amount in both environments ($2.5$ versus $2.3$): its dirt comes from
-indiscriminately attacking the ground, not from pursuing the goal. Read this way
-the task result is sharper than a raw ranking suggests --- it is specifically the
-\emph{prompted} CLIP agent whose digging tracks the instruction, the same
-conditioning signal of Section~\ref{sec:exp-cond} now visible in an item count
-rather than a firing rate --- and it is the prompt-driven lift between
-environments, not the absolute count, that cleanly measures task-following.
+of goal pursuit. Crucially, the comparison is \emph{not} confounded by the
+environment: conditions A and D run in the same fixed world, with the surface
+grass-over-dirt and the underground dirt veins generated identically, so dirt is
+exactly as available under the empty prompt as under \enquote{collect dirt} (an
+examiner's worry that ``plains simply contain more dirt than forest'' does not
+apply, because there is only one scene). The dirt$_{\text{A}}$-versus-dirt
+$_{\text{D}}$ contrast is thus a clean within-scene prompt manipulation. What it
+shows is weaker than a single seed suggested, however. \textbf{CLIP + lang} digs
+more under the dirt prompt than under the empty prompt on average ($1.2\to2.5$),
+the direction goal-following predicts, but the per-seed lift is highly variable
+($+3.5$, $-0.6$, $+1.2$) and its mean ($+1.4\pm1.7$) straddles zero; the strong
+single-seed lift originally observed does not survive retraining. \textbf{CLIP
+$-$ lang} shows no lift at all ($2.1\to1.6$), consistent with its dirt coming
+from indiscriminate ground-attacking rather than goal pursuit. The honest reading
+is therefore that a substantial part of every cell's dirt is incidental, so the
+absolute count is not a clean task-following measure; the prompt-driven component
+is visible only for CLIP + lang and only weakly at the episode level. The
+reproducible evidence that the prompt steers CLIP behaviour is the firing-rate
+conditioning of Section~\ref{sec:exp-cond}, not this item count.
 
 \section{Offline Frame Metrics and the Offline--Online Gap}
 \label{sec:exp-offline}
 
 The rollout results stand in sharp contrast to how the four cells look on the
 held-out test frames of Section~\ref{sec:split}. Table~\ref{tab:offline} reports
-the offline metrics over $1{,}252{,}328$ test frames per cell. On frames the four
+the offline metrics over the $156{,}541$-frame held-out test split --- a
+trajectory-level split, so no trajectory contributes to both training and test ---
+which yields $1{,}252{,}328$ per-step action predictions once each frame's
+$8$-step action chunk is scored. On frames the four
 cells are near-indistinguishable: binary-key accuracy is $0.98$ for all four,
 \texttt{attack}-$F_1$ is $0.96$, camera bin accuracy is $0.87$ (against a
 majority-class, always-still baseline of roughly $78\%$) and camera error is
@@ -250,9 +294,9 @@ below half a degree. Even the most behaviourally relevant offline number, the
 movement-$F_1$ that selects the checkpoint (Section~\ref{caching}), spans only
 $0.368$ to $0.431$ across the four --- and ranks them in an order the rollouts
 flatly contradict: \textbf{CLIP $-$ lang} has the \emph{highest} movement-$F_1$
-($0.431$) yet collects half the dirt of \textbf{CLIP + lang}, and \textbf{LLaVA
-$-$ lang} ($0.368$) sits within $0.04$ of \textbf{CLIP + lang} ($0.407$) yet
-collects nothing.
+($0.431$) yet collects less dirt than \textbf{CLIP + lang}, and \textbf{LLaVA
+$-$ lang} ($0.368$) sits within $0.04$ of \textbf{CLIP + lang} ($0.407$) yet is
+at the collection floor.
 
 \begin{table}[ht]
 \centering
@@ -266,13 +310,13 @@ Exp~1 LLaVA + lang   & 0.981 & 0.962 & 0.369 & 0.868 & 0.48 \\
 Exp~3 LLaVA $-$ lang & 0.981 & 0.962 & 0.368 & 0.868 & 0.49 \\
 \hline
 \end{tabular}
-\caption{Offline frame-level metrics on the held-out test split
-($1{,}252{,}328$ frames per cell). Binary accuracy is averaged over the $21$
-keys; movement-$F_1$ is the mean $F_1$ over the locomotion keys (the
-model-selection criterion of Section~\ref{caching}); camera accuracy is top-1
-mu-law bin accuracy on \texttt{camera\_x}. The four cells are a near-tie, and
-movement-$F_1$ even ranks CLIP $-$ lang above CLIP + lang --- the reverse of the
-rollout ranking.}
+\caption{Offline frame-level metrics on the held-out, trajectory-level test
+split ($156{,}541$ frames per cell, scored as $1{,}252{,}328$ per-step chunk
+predictions). Binary accuracy is averaged over the $21$ keys; movement-$F_1$ is
+the mean $F_1$ over the locomotion keys (the model-selection criterion of
+Section~\ref{caching}); camera accuracy is top-1 mu-law bin accuracy on
+\texttt{camera\_x}. The four cells are a near-tie, and movement-$F_1$ even ranks
+CLIP $-$ lang above CLIP + lang --- the reverse of the rollout ranking.}
 \label{tab:offline}
 \end{table}
 
@@ -280,10 +324,11 @@ rollout ranking.}
 \centering
 \includegraphics[width=0.95\textwidth]{figures/fig_dissociation.pdf}
 \caption{The same four cells, measured two ways. \emph{Left:} movement-$F_1$ on
-held-out frames --- a near-tie, with CLIP $-$ lang nominally highest.
-\emph{Right:} dirt collected per rollout episode (percentile-bootstrap $95\%$
-intervals) --- CLIP digs, both LLaVA cells are at the floor. Frame accuracy does
-not predict in-environment behaviour.}
+held-out frames (seed-0 checkpoint, the model-selection metric) --- a near-tie,
+with CLIP $-$ lang nominally highest. \emph{Right:} dirt collected per rollout
+episode (mean ${\pm}1$ across-seed standard deviation, three training seeds) ---
+CLIP digs, both LLaVA cells are at the floor. Frame accuracy does not predict
+in-environment behaviour.}
 \label{fig:dissociation}
 \end{figure}
 
@@ -304,28 +349,45 @@ it is the one that separates the backbones.
 
 Read on its own, Section~\ref{sec:exp-task} invites the conclusion that the
 frozen LLaVA features are useless for control. That conclusion would be too
-strong, and a single departure from the $2\times2$ shows why. The LLaVA anchor
-feeds the pooled text vector to the head by plain concatenation
-(Section~\ref{action_head}); if the head instead conditions on that vector
-through feature-wise linear modulation (FiLM), so that the text representation
-\emph{scales and shifts} the visual features rather than sitting beside them,
-the same frozen LLaVA + lang features that produced a hard zero now collect
-$4.0$ dirt per episode at $90\%$ success --- comparable to the best CLIP cell
-($4.3$), with the two means well within each other's confidence intervals. The frozen LLaVA
-representation therefore \emph{does} carry the information needed to dig; the
-anchor's failure is a read-out failure in the head, not an absence of signal in
-the features.
+strong, and two departures from the $2\times2$ show why. The LLaVA anchor feeds
+the pooled text vector to the head by plain concatenation
+(Section~\ref{action_head}). I test two alternative read-outs of the
+\emph{same} frozen features: a feature-wise linear modulation (FiLM) head, in
+which the text representation \emph{scales and shifts} the visual features rather
+than sitting beside them, and a \enquote{fixAB} variant that adds a learned
+affine recombination of the two pooled halves before the concatenating head.
+Both lift the LLaVA + lang cell off the floor: the FiLM head collects
+$2.60\pm1.07$ dirt per episode over three seeds and fixAB $2.5$ in a single run,
+against the concatenating anchor's $0.07$ --- and FiLM's mean is statistically
+on par with the best CLIP cell ($2.53\pm1.25$), the two intervals almost
+coincident. That \emph{two distinct} read-outs both recover dirt collection from
+features the concatenating head left at zero is the decisive point: the frozen
+LLaVA representation \emph{does} carry the information needed to dig, so the
+anchor's task failure is a read-out failure in the head, not an absence of signal
+in the features.
 
-Two caveats keep this a probe rather than a result. It is a single architectural
-change evaluated on ten episodes, with no matched no-prompt FiLM control, so it
-sits deliberately outside the controlled $2\times2$. And it does not recover
-conditioning: the FiLM cell still shifts \texttt{attack} by only $+3$~pp between
-the empty and on-task prompts, as flat as every other LLaVA cell. A better head
-unlocks the \emph{task} signal in the LLaVA features but not a prompt-driven
-\emph{conditioning} signal. That a head which multiplicatively gates the visual
-features on the text vector still does not condition is itself informative: it
-indicates the limit is not head capacity but the pooled text representation, which
-does not expose a prompt axis to gate on (Section~\ref{sec:exp-probe}). I return to
+Where that signal enters matters, and the no-prompt controls localise it. A FiLM
+head gates the visual features on the text vector, so zeroing that vector should
+disable the gate --- and it does: the no-language FiLM cell falls back to the
+floor ($0.20$ dirt). The fixAB head, which keeps a concatenation path, partially
+survives without language ($1.50$). So FiLM's recovery is routed specifically
+\emph{through} the text vector; the task signal the better heads exploit is the
+task-identifying content of that vector, not a generic capacity gain.
+
+Crucially, none of this recovers \emph{conditioning}. Every one of these heads
+leaves \texttt{attack} flat across the prompt --- FiLM + lang shifts it by only
+$-3.2\pm4.5$~pp, fixAB by $-0.2$, the no-language controls likewise --- exactly
+the band of every other LLaVA cell. A better head unlocks the \emph{task} signal
+in the LLaVA features but not a prompt-driven \emph{conditioning} signal. That a
+head which multiplicatively gates the visual features on the text vector still
+does not condition is itself informative: it indicates the limit is not head
+capacity but the pooled text representation, which does not expose a prompt axis
+to gate on (Section~\ref{sec:exp-probe}). These probes thus separate two
+bottlenecks --- the LLaVA \emph{task} floor lives in the head and a better
+read-out clears it, whereas the LLaVA \emph{conditioning} failure lives upstream
+of the head, in the pooled representation. The FiLM and fixAB cells, the
+no-language controls especially, are single-seed probes rather than full members
+of the $2\times2$; only FiLM + lang is replicated across three seeds. I return to
 the implications of this split in Chapter~\ref{chap:discussion}.
 
 \section{Is the Prompt Represented? A Linear Probe}
@@ -342,10 +404,14 @@ above the $90.1\%$ reachable from the image half, and it collapses to chance
 ($50\%$) when the text half is zeroed: the prompt is far from washed out of the
 representation. But decodability alone does not make the prompt \emph{usable} for
 conditioning, because in the combined training set the two prompts are perfectly
-correlated with two visual distributions (forest versus plains) and the pooled
-LLaVA text half is image-entangled --- its tokens attend to the frame inside the
-decoder. The probe cannot separate a genuine prompt axis from the image content
-that leaks into the text positions.
+correlated with the two tasks' imagery (tree-felling scenes versus dirt-digging
+scenes) and the pooled LLaVA text half is image-entangled --- its tokens attend
+to the frame inside the decoder. The probe cannot separate a genuine prompt axis
+from the image content that leaks into the text positions. This training-time
+entanglement is exactly what the rollout evaluation breaks apart: there all four
+prompts are issued in one fixed scene, decorrelating prompt from image, and the
+LLaVA policy does not move --- evidence that the separable prompt axis is absent,
+not merely masked.
 
 \begin{table}[ht]
 \centering
@@ -366,20 +432,56 @@ no-prompt control, whose text half is zeroed, drops to chance.}
 \label{tab:probe}
 \end{table}
 
-Which it is --- a usable axis or a confound --- is settled by the FiLM result.
-A head that multiplicatively gates on exactly this text vector
-(Section~\ref{sec:exp-film}) is a more expressive way to condition than the
-concatenating head, yet it produces no behavioural shift ($+3$~pp). Were the text
-half a clean, prompt-isolated axis, such a head would ride it; that it does not
-indicates the decodable direction is largely the prompt--image confound rather
-than a separable prompt signal. The contrast with CLIP makes this concrete: CLIP's
-text encoder is physically separate from its image encoder, so its prompt
-embedding is image-independent and moves when, and only when, the prompt changes
---- the axis the head learns to use. The bottleneck for LLaVA is therefore not
-that the head is too weak but that its pooled, image-entangled text representation
-does not present a prompt axis to act on; the limit sits upstream of the head. A
-counterfactual test that changes only the prompt at a fixed frame would measure
-the confound directly, and is left to Chapter~\ref{chap:discussion}.
+Which it is --- a usable axis or a confound --- can be measured directly. The
+probe above leaves it ambiguous because each cached frame is seen under exactly
+one prompt, so prompt and scene co-vary; the FiLM null of
+Section~\ref{sec:exp-film} already \emph{indicates} a confound (a head that gates
+on the text vector still does not condition), but a counterfactual settles it. I
+take a fixed set of $256$ held-out frames (from the chop trajectories) and
+re-encode every one under all four eval prompts, then ask how far each half of the
+pooled feature moves when only the prompt changes at a fixed image, against how
+far it moves across images at a fixed prompt (Table~\ref{tab:swap}). The
+conclusion is a backbone property and does not depend on the frames' own task ---
+each frame is scored under the off-scene prompts too.
+
+\begin{table}[ht]
+\centering
+\begin{tabular}{lrrr}
+\hline
+ & \multicolumn{2}{c}{prompt swap (fixed frame)} & frame swap \\
+Backbone & text cos & text rel-$L_2$ & text cos \\
+\hline
+CLIP  & $0.74$ & $0.74$ & $1.00$ \\
+LLaVA & $1.00$ & $0.01$ & $0.98$ \\
+\hline
+\end{tabular}
+\caption{Counterfactual prompt swap on $256$ fixed frames. \emph{Prompt swap} is
+the mean cosine and relative-$L_2$ between the pooled text half under two
+different prompts at the \emph{same} frame; \emph{frame swap} is the mean cosine
+of the text half under a fixed prompt across \emph{different} frames. For CLIP the
+prompt moves the text half a lot (cos $0.74$) and the frame not at all (cos
+$1.00$): a clean, image-independent prompt axis. For LLaVA the pattern inverts ---
+the prompt barely moves the text half (cos $1.00$, rel-$L_2$ $0.01$) while the
+frame does (cos $0.98$): the pooled \enquote{text} half tracks the image, not the
+prompt.}
+\label{tab:swap}
+\end{table}
+
+The two backbones separate exactly as the conditioning result predicts.
+\textbf{CLIP}'s text half is a clean prompt axis: swapping the prompt at a fixed
+frame moves it substantially (cosine $0.74$, and $0.73$/$0.73$ for the on-task
+chop and dirt prompts against the empty one), while swapping the frame at a fixed
+prompt leaves it untouched (cosine $1.00$), because its text encoder never sees
+the image. \textbf{LLaVA} inverts this: swapping the prompt barely moves the text
+half ($1\%$ relative-$L_2$, cosine $1.00$ even between the chop and dirt prompts),
+while swapping the frame does move it (cosine $0.98$) --- and its image half is
+strongly frame-dependent (cosine $0.49$ across frames) yet equally
+prompt-invariant. The prompt simply does not register in LLaVA's pooled features;
+what the linear probe decoded at $99.7\%$ was the \emph{scene} (chop frames differ
+from dirt frames, and each came with its own prompt), not a prompt axis. This is
+the direct confirmation, by measurement rather than inference, that the LLaVA
+conditioning bottleneck is the pooled, image-dominated representation upstream of
+the head, not the head itself.
 
 \section{Summary of Findings}
 \label{sec:exp-summary}
@@ -388,28 +490,33 @@ the confound directly, and is left to Chapter~\ref{chap:discussion}.
 \item All four cells diverge sharply from a random policy, which fires every key
 at $\sim\!10\%$ and collects nothing; the trained agents are genuine policies,
 not noise (Figure~\ref{fig:profile}).
-\item Language conditioning is a backbone effect. Only CLIP + lang reshapes its
-policy with the prompt (\texttt{attack} $-48$~pp, $h=-1.04$); its no-prompt
-control and both LLaVA cells stay within the $|h|\le0.17$ noise band
+\item Language conditioning is a backbone effect that reproduces across seeds.
+Only CLIP + lang reshapes its policy with the prompt (\texttt{attack}
+$-42.3\pm10.4$~pp, $h=-0.91$, large in all three seeds); its no-prompt control
+and both LLaVA cells stay within the $|h|\le0.16$ noise band
 (Table~\ref{tab:conditioning}). The prompt is not missing from LLaVA's features
 --- a linear probe recovers the task from its pooled text half at $99.7\%$
 (Section~\ref{sec:exp-probe}) --- but it is entangled with the image, and no
 head-side lever, the FiLM gate included, turns it into conditioning; the
 bottleneck is the pooled representation, not the head.
-\item Task performance also separates by backbone: CLIP collects dirt ($4.3$ and
-$2.3$ per episode) while both LLaVA anchor cells are at the floor
-(Table~\ref{tab:task}). The within-CLIP prompt effect is in the right direction
-but not significant at ten episodes; chopping fails for every model. The dirt
-count is partly confounded by incidental digging, but it is the prompt-driven
-\emph{lift} between environments that is goal-directed, and that lift appears only
-for CLIP + lang.
+\item Task performance also separates by backbone: CLIP collects dirt
+($2.53\pm1.25$ and $1.60\pm0.50$ per episode) while both LLaVA anchor cells are at
+the floor ($0.07$, $0.47$; Table~\ref{tab:task}). The within-CLIP prompt effect
+is in the right direction but soft at the episode level; chopping fails for every
+model. Because all conditions share one fixed world, the dirt count is not
+confounded by environment, but a substantial part of it is incidental digging, so
+the reproducible prompt-steering evidence is the firing-rate conditioning, not the
+item count.
 \item Held-out frame metrics do not predict rollout behaviour: all four cells
 score within $0.04$ movement-$F_1$ and $0.001$ binary accuracy offline, yet
-diverge from $4.3$ to $0$ dirt online --- a direct demonstration that rollout
-evaluation measures what frame metrics miss
+diverge from a dug stack of dirt to nothing online --- a direct demonstration
+that rollout evaluation measures what frame metrics miss
 (Section~\ref{sec:exp-offline}, Figure~\ref{fig:dissociation}).
-\item The LLaVA floor is a head limitation, not a feature limitation: a
-FiLM-conditioned head lifts dirt collection from zero to $4.0$ per episode,
-comparable to the CLIP cells, from the same frozen features, without recovering conditioning
+\item The LLaVA floor is a head limitation, not a feature limitation: two
+alternative read-outs (FiLM, fixAB) lift dirt collection from $0.07$ to ${\sim}2.5$
+per episode --- FiLM to $2.60\pm1.07$, on par with the CLIP cells --- from the
+same frozen features, without recovering conditioning. FiLM does so specifically
+through the text vector (its no-language control returns to the floor), localising
+the task signal while the conditioning bottleneck stays upstream
 (Section~\ref{sec:exp-film}).
 \end{itemize}

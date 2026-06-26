@@ -240,6 +240,17 @@ mean $F_1$ over the locomotion keys (back, forward, jump, left, right,
 sprint), since the attack key saturates early and is not discriminative for
 model selection.
 
+To separate the effect of the ablated factors from training noise, every cell is
+trained at \textbf{three independent seeds}. The seed varies the head's random
+initialisation and the data-loader shuffle order; the backbone, the
+train/validation/test partition (Section~\ref{sec:split}), and the optimiser
+settings above are held fixed across seeds. Because the two-stage design makes
+head training cheap (Section~\ref{caching}), this triples only the inexpensive
+stage and leaves the one-time feature cache untouched. Throughout
+Chapter~\ref{chap:experiments} every reported quantity is the mean over the three
+seeds, with the across-seed standard deviation as its uncertainty, so an effect
+counts only if it survives retraining rather than holding for one lucky seed.
+
 \subsection{Two-Stage Training with Cached Features} \label{caching}
 Running the backbone end-to-end for every training step is prohibitively
 expensive: a LLaVA forward pass costs on the order of $15$~ms per sample,

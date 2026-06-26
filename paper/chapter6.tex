@@ -23,17 +23,22 @@ Chapter~\ref{chap:intro} to the evidence that settles it.
  & Question & Finding \\
 \hline
 RQ1 \newline (backbone) & Used only as a frozen extractor, does a joint VLM beat
-a contrastive one? & \textbf{No}, in this regime. CLIP collects $4.3$ dirt per
-episode where the matched LLaVA cell is at the floor ($0.0$); the gap is a
-read-out effect, since a FiLM head recovers CLIP-level collection from the same
-LLaVA features (Sections~\ref{sec:exp-task}, \ref{sec:exp-film}). \\
+a contrastive one? & \textbf{No}, in this regime. CLIP collects $2.5$ dirt per
+episode where the matched LLaVA cell is at the floor ($0.07$); the gap is a
+read-out effect, since two alternative heads (FiLM, fixAB) recover CLIP-level
+collection from the same LLaVA features
+(Sections~\ref{sec:exp-task}, \ref{sec:exp-film}). \\
 RQ2 \newline (language) & Does the prompt change behaviour, and does it depend on
 the backbone? & \textbf{Yes}, and it depends entirely on the backbone. Only
-CLIP + lang shifts (\texttt{attack} $-48$~pp, $h=-1.04$); both LLaVA cells and the
-CLIP control are flat (Section~\ref{sec:exp-cond}). \\
+CLIP + lang shifts (\texttt{attack} $-42\pm10$~pp, $h=-0.91$, in all three seeds);
+both LLaVA cells and the CLIP control are flat (Section~\ref{sec:exp-cond}). The
+prompt \emph{steers} behaviour but not necessarily toward the goal --- the robust
+shift is a \emph{suppression} of the action chopping needs
+(Section~\ref{sec:disc-chop}). \\
 RQ3 \newline (evaluation) & Do rollouts reveal what frame metrics miss? &
 \textbf{Yes}, decisively. The four cells are a near-tie on held-out frames yet
-diverge from $4.3$ to $0$ dirt in rollout (Section~\ref{sec:exp-offline}). \\
+diverge from a dug stack of dirt to nothing in rollout
+(Section~\ref{sec:exp-offline}). \\
 \hline
 \end{tabular}
 \caption{The three research questions and the evidence that settles each.}
